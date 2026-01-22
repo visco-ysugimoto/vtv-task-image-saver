@@ -72,7 +72,15 @@ Write-Host "If not logged in, run: gh auth login" -ForegroundColor Yellow
 Write-Host "Target: https://github.com/$RepoOwner/$RepoName" -ForegroundColor Cyan
 
 # Ensure remote points to the requested repo (repo is expected to exist; create manually if needed)
-git remote remove origin 2> $null
+try {
+  # Remove only if it exists (avoid failing with: "No such remote: 'origin'")
+  $hasOrigin = (git remote) -contains "origin"
+  if ($hasOrigin) {
+    git remote remove origin *> $null
+  }
+} catch {
+  # ignore
+}
 git remote add origin "https://github.com/$RepoOwner/$RepoName.git"
 git branch -M main
 
