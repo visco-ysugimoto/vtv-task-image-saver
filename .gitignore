@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.so
+.Python
+
+# Virtual envs / tools
+.venv/
+venv/
+ENV/
+env/
+.env
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+coverage.xml
+
+# OS / editors
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+
+# Build artifacts (PyInstaller etc.)
+build/
+dist/
+*.spec.bak
+*.log
+
+# Binaries / archives
+*.exe
+*.msi
+*.zip
+*.7z
+*.rar
+
+# App local config (環境依存)
+共有VTVフォルダパス.json
+
