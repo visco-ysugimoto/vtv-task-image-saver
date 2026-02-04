@@ -29,6 +29,8 @@ desktop.ini
 # Build artifacts (PyInstaller etc.)
 build/
 dist/
+dist_fletpack/
+dist_fletpack2/
 *.spec.bak
 *.log
 
