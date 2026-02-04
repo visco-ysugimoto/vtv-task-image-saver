@@ -1,2 +1,4 @@
 Pillow>=10.0.0
-
+flet>=0.21.0
+flet-desktop>=0.80.0
+pyinstaller>=6.0.0

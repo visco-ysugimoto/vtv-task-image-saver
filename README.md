@@ -38,5 +38,33 @@ python .\main_save_task_images.py
 
 ## ビルド（PyInstaller）
 
+### Flet版のビルド方法
+
+PowerShellスクリプトを使用する場合（推奨）:
+
+```powershell
+# ビルドスクリプトを実行
+.\build_exe.ps1
+```
+
+手動でビルドする場合:
+
+```powershell
+# 依存関係のインストール
+pip install -r requirements.txt
+
+# フォルダ版（複数ファイル、起動が速い）
+pyinstaller main_save_task_images_flet.spec --noconfirm
+
+# 単一exe版（配布が簡単、ファイルサイズ大）
+pyinstaller main_save_task_images_flet_onefile.spec --noconfirm
+```
+
+ビルド成果物:
+- フォルダ版: `dist\TaskImageSaver\TaskImageSaver.exe`
+- 単一exe版: `dist\TaskImageSaver.exe`
+
+### 旧版（tkinter版）
+
 `main_save_task_images.spec` を使ってexe化できます（生成物はコミット対象外です）。
 
