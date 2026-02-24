@@ -20,6 +20,16 @@ pip install --upgrade pip
 pip install pyinstaller
 pip install -r requirements.txt
 
+# アイコン変換（icon_image.png → icon_image.ico）
+Write-Host ""
+Write-Host "アイコンを変換しています (PNG → ICO)..." -ForegroundColor Yellow
+python -c "from PIL import Image; img = Image.open('icon_image.png'); img.save('icon_image.ico', format='ICO', sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])"
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "アイコン変換に失敗しました。" -ForegroundColor Red
+    exit 1
+}
+Write-Host "アイコン変換完了: icon_image.ico" -ForegroundColor Green
+
 # 以前のビルド成果物をクリーンアップ
 Write-Host ""
 Write-Host "以前のビルド成果物をクリーンアップしています..." -ForegroundColor Yellow

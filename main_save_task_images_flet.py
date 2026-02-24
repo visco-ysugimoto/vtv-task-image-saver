@@ -1,6 +1,7 @@
 import flet as ft
 import os
 import sys
+import ctypes
 from PIL import Image
 import shutil
 import zipfile
@@ -17,6 +18,129 @@ from collections import defaultdict
 # tkinterのfiledialogを使用
 import tkinter as tk
 from tkinter import filedialog
+
+# Windows タスクバーで独自アイコンを表示するための AppUserModelID 設定
+if sys.platform == "win32":
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+        "viscotech.taskimagesaver.1.0"
+    )
+
+
+def _resolve_resource_path(filename: str) -> str | None:
+    """PyInstaller exe / 開発環境の両方でリソースファイルのパスを解決する"""
+    candidates = []
+    base_meipass = getattr(sys, "_MEIPASS", None)
+    if base_meipass:
+        candidates.append(os.path.join(base_meipass, filename))
+    exe_dir = os.path.dirname(sys.executable)
+    candidates.append(os.path.join(exe_dir, "_internal", filename))
+    candidates.append(os.path.join(exe_dir, filename))
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates.append(os.path.join(_script_dir, filename))
+    for p in candidates:
+        if p and os.path.exists(p):
+            return os.path.abspath(p)
+    return None
+
+
+def _set_window_icon_win32(window_title: str, ico_path: str):
+    """Win32 API でウィンドウのタイトルバー・タスクバーアイコンを直接設定する"""
+    if sys.platform != "win32" or not ico_path:
+        return
+
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+
+    user32.LoadImageW.restype = wintypes.HANDLE
+    user32.LoadImageW.argtypes = [
+        wintypes.HINSTANCE, wintypes.LPCWSTR, wintypes.UINT,
+        ctypes.c_int, ctypes.c_int, wintypes.UINT,
+    ]
+    user32.FindWindowW.restype = wintypes.HWND
+    user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+    user32.SendMessageW.restype = ctypes.c_ssize_t
+    user32.SendMessageW.argtypes = [
+        wintypes.HWND, wintypes.UINT, ctypes.c_size_t, ctypes.c_ssize_t,
+    ]
+    user32.SetClassLongPtrW.restype = ctypes.c_size_t
+    user32.SetClassLongPtrW.argtypes = [
+        wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t,
+    ]
+    user32.GetWindowThreadProcessId.argtypes = [
+        wintypes.HWND, ctypes.POINTER(wintypes.DWORD),
+    ]
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    WNDENUMPROC = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM,
+    )
+
+    IMAGE_ICON = 1
+    LR_LOADFROMFILE = 0x00000010
+    WM_SETICON = 0x0080
+    ICON_SMALL = 0
+    ICON_BIG = 1
+    GCLP_HICON = -14
+    GCLP_HICONSM = -34
+    SM_CXSMICON = 49
+    SM_CYSMICON = 50
+
+    def _find_process_windows():
+        """現在プロセスの全トップレベルウィンドウを取得"""
+        pid = os.getpid()
+        hwnds = []
+
+        @WNDENUMPROC
+        def cb(hwnd, _):
+            wpid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
+            if wpid.value == pid and user32.IsWindowVisible(hwnd):
+                hwnds.append(hwnd)
+            return True
+
+        user32.EnumWindows(cb, 0)
+        return hwnds
+
+    def _apply_icon(hwnds, hicon_small, hicon_big):
+        for hwnd in hwnds:
+            if hicon_small:
+                user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon_small)
+                user32.SetClassLongPtrW(hwnd, GCLP_HICONSM, hicon_small)
+            if hicon_big:
+                user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, hicon_big)
+                user32.SetClassLongPtrW(hwnd, GCLP_HICON, hicon_big)
+
+    def apply():
+        time.sleep(1.5)
+        hwnds = _find_process_windows()
+        if not hwnds:
+            hwnd = user32.FindWindowW(None, window_title)
+            if hwnd:
+                hwnds = [hwnd]
+        if not hwnds:
+            print("Window not found for icon setting")
+            return
+
+        sm_cx = user32.GetSystemMetrics(SM_CXSMICON) or 16
+        sm_cy = user32.GetSystemMetrics(SM_CYSMICON) or 16
+        hicon_small = user32.LoadImageW(
+            None, ico_path, IMAGE_ICON, sm_cx, sm_cy, LR_LOADFROMFILE,
+        )
+        hicon_big = user32.LoadImageW(
+            None, ico_path, IMAGE_ICON, 48, 48, LR_LOADFROMFILE,
+        )
+        print(f"Icon handles: small={hicon_small} ({sm_cx}x{sm_cy}), big={hicon_big}")
+        print(f"Target windows: {len(hwnds)}")
+
+        _apply_icon(hwnds, hicon_small, hicon_big)
+
+        for delay in (1.0, 2.0):
+            time.sleep(delay)
+            _apply_icon(hwnds, hicon_small, hicon_big)
+
+    threading.Thread(target=apply, daemon=True).start()
+
 
 # スクリプトの実行ディレクトリを取得
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -134,27 +258,14 @@ def main(page: ft.Page):
     page.padding = 0
     page.theme_mode = ft.ThemeMode.LIGHT
     
-    # アイコンを設定（exe化しても参照できるように解決）
-    def resolve_resource_path(filename: str) -> str | None:
-        candidates = []
-        # PyInstaller (onefile/onedir) の場合、sys._MEIPASS が使える
-        base_meipass = getattr(sys, "_MEIPASS", None)
-        if base_meipass:
-            candidates.append(os.path.join(base_meipass, filename))
-        # onedir の場合は exe と同階層に配置されることが多い
-        candidates.append(os.path.join(os.path.dirname(sys.executable), filename))
-        # 開発実行時
-        candidates.append(os.path.join(script_dir, filename))
+    # Flet の window.icon でアイコンを設定
+    icon_png = _resolve_resource_path("icon_image.png")
+    if icon_png:
+        page.window.icon = icon_png
 
-        for p in candidates:
-            if p and os.path.exists(p):
-                return p
-        return None
-
-    # window.icon は png 推奨。無ければ ico を試す
-    icon_path = resolve_resource_path("icon_image.png") or resolve_resource_path("save_task_images.ico")
-    if icon_path:
-        page.window.icon = icon_path
+    # Win32 API でタイトルバー・タスクバーアイコンを直接上書き
+    icon_ico = _resolve_resource_path("icon_image.ico")
+    _set_window_icon_win32(page.title, icon_ico)
     page.theme = ft.Theme(
         color_scheme_seed=ft.Colors.BLUE,
         font_family="Yu Gothic UI",
@@ -194,6 +305,7 @@ def main(page: ft.Page):
     preview_cam_ref = ft.Ref[ft.TextField]()
     preview_div_ref = ft.Ref[ft.TextField]()
     preview_index_ref = ft.Ref[ft.TextField]()
+    preview_file_ref = ft.Ref[ft.TextField]()
     
     # 処理中フラグ（重複実行防止用）
     app_state = {
@@ -202,9 +314,9 @@ def main(page: ft.Page):
 
     # オプション説明テキスト
     option_descriptions = {
-        "option1": "現在の選択:\n\nVTV9000上のタスクから\n(オフラインPC)\n\n━━━━━━━━━━━━━━━━━━\n\nオフライン上にインストールされているVTV-9000内のタスクに格納されている画像ファイルを任意のオプションで保存します。\n\nタスクを保存しているグループ番号とタスク番号を入力してください。",
-        "option2": "現在の選択:\n\nタスクファイルから\n(ziq, zit, zii)\n\n━━━━━━━━━━━━━━━━━━\n\nタスクファイル(ziq, zit, zii)に格納されている画像ファイルを任意のオプションで保存します。\n\n画像が格納されているタスクファイルを選択してください。",
-        "option3": "現在の選択:\n\nVTV9000上のタスクから\n(共有VTV)\n\n━━━━━━━━━━━━━━━━━━\n\nネットワーク上にインストールされているVTV-9000内のタスクに格納されている画像ファイルを任意のオプションで保存します。\n\n共有しているVTV-9000の「viscotech」フォルダを選択してください。\nまた共有VTV-900側の画像を保存しているグループ番号とタスク番号を入力してください。",
+        "option1": "現在の選択:\n\nVTV9000上のタスクから\n(オフラインPC)\n\n━━━━━━━━━━━━━━━━\n\nオフライン上にインストールされているVTV-9000内のタスクに格納されている画像ファイルを任意のオプションで保存します。\n\nタスクを保存しているグループ番号とタスク番号を入力してください。",
+        "option2": "現在の選択:\n\nタスクファイルから\n(ziq, zit, zii)\n\n━━━━━━━━━━━━━━━━\n\nタスクファイル(ziq, zit, zii)に格納されている画像ファイルを任意のオプションで保存します。\n\n画像が格納されているタスクファイルを選択してください。",
+        "option3": "現在の選択:\n\nVTV9000上のタスクから\n(共有VTV)\n\n━━━━━━━━━━━━━━━━\n\nネットワーク上にインストールされているVTV-9000内のタスクに格納されている画像ファイルを任意のオプションで保存します。\n\n共有しているVTV-9000の「viscotech」フォルダを選択してください。\nまた共有VTV-900側の画像を保存しているグループ番号とタスク番号を入力してください。",
     }
 
     def show_message_dialog(title: str, message: str):
@@ -869,7 +981,7 @@ def main(page: ft.Page):
             camera_dialog.open = True
             page.update()
         
-        allowed_placeholders = {"comment", "tool", "original", "cam", "div", "index"}
+        allowed_placeholders = {"comment", "tool", "original", "cam", "div", "index", "file"}
         placeholder_pattern = re.compile(r"\{([a-zA-Z0-9_]+)(?::[^{}]+)?\}")
 
         def extract_unknown_placeholders(template: str):
@@ -909,6 +1021,7 @@ def main(page: ft.Page):
             sample_cam = _parse_int_from_textfield(preview_cam_ref.current, 1)
             sample_div = _parse_int_from_textfield(preview_div_ref.current, 2)
             sample_index = _parse_int_from_textfield(preview_index_ref.current, 3)
+            sample_file = (preview_file_ref.current.value if preview_file_ref.current else "260120115606036") or "260120115606036"
 
             tool_value = sample_tool_capture if condition == 1 else sample_tool_other
             comment_value = sample_comment if condition in (1, 2) else ""
@@ -923,6 +1036,7 @@ def main(page: ft.Page):
                     cam=sample_cam,
                     div=sample_div,
                     index=sample_index,
+                    file_source=sample_file,
                 )
             except Exception:
                 # 例外が出た場合はそのまま返す（UIが落ちないように）
@@ -1147,6 +1261,7 @@ def main(page: ft.Page):
                                             ft.Text("{cam} - カメラ番号", size=10),
                                             ft.Text("{div} - DIV番号（列番号）", size=10),
                                             ft.Text("{index} - 連番", size=10),
+                                            ft.Text("{file} - 参照元テキストファイル名", size=10),
                                         ],
                                         spacing=2,
                                         ),
@@ -1242,6 +1357,21 @@ def main(page: ft.Page):
                                                     ref=preview_index_ref,
                                                     label="index",
                                                     value="3",
+                                                    dense=True,
+                                                    text_size=11,
+                                                    content_padding=ft.padding.symmetric(horizontal=10, vertical=8),
+                                                    expand=True,
+                                                    on_change=on_template_change,
+                                                ),
+                                            ],
+                                            spacing=8,
+                                        ),
+                                        ft.Row(
+                                            [
+                                                ft.TextField(
+                                                    ref=preview_file_ref,
+                                                    label="file（参照元テキストファイル名）",
+                                                    value="260120115606036",
                                                     dense=True,
                                                     text_size=11,
                                                     content_padding=ft.padding.symmetric(horizontal=10, vertical=8),
