@@ -2,22 +2,26 @@ import flet as ft
 import os
 import sys
 import ctypes
-from PIL import Image
 import shutil
 import zipfile
-import json
 import threading
 import traceback
 import time
 import asyncio
 import re
+import io
+import tempfile
 from datetime import datetime
-import save_task_images_CamNum_selection
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# tkinterのfiledialogを使用
 import tkinter as tk
 from tkinter import filedialog
+
+import save_task_images_CamNum_selection
+from config import ConfigManager
+from PIL import Image
+from utils import format_value, convert_bmp_to_jpeg
 
 # Windows タスクバーで独自アイコンを表示するための AppUserModelID 設定
 if sys.platform == "win32":
@@ -25,6 +29,10 @@ if sys.platform == "win32":
         "viscotech.taskimagesaver.1.0"
     )
 
+
+# ---------------------------------------------------------------------------
+# モジュールレベルのユーティリティ関数
+# ---------------------------------------------------------------------------
 
 def _resolve_resource_path(filename: str) -> str | None:
     """PyInstaller exe / 開発環境の両方でリソースファイルのパスを解決する"""
@@ -87,7 +95,6 @@ def _set_window_icon_win32(window_title: str, ico_path: str):
     SM_CYSMICON = 50
 
     def _find_process_windows():
-        """現在プロセスの全トップレベルウィンドウを取得"""
         pid = os.getpid()
         hwnds = []
 
@@ -142,85 +149,7 @@ def _set_window_icon_win32(window_title: str, ico_path: str):
     threading.Thread(target=apply, daemon=True).start()
 
 
-# スクリプトの実行ディレクトリを取得
-script_dir = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(script_dir, "共有VTVフォルダパス.json")
-
-
-def load_config():
-    """設定を読み込む関数"""
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "r") as file:
-            print("Config file is loaded to:", os.path.abspath(CONFIG_FILE))
-            return json.load(file)
-    return {}
-
-
-def save_config(config):
-    """設定を保存する関数"""
-    with open(CONFIG_FILE, "w") as file:
-        print("Config file will be saved to:", os.path.abspath(CONFIG_FILE))
-        json.dump(config, file, indent=4)
-
-
-def format_value(value):
-    """1桁の数字に対して、先頭に0を付ける関数"""
-    try:
-        return f"{int(value):02}"
-    except (ValueError, TypeError):
-        return "00"
-
-
-def convert_bmp_to_jpeg(folder, quality=85, progress_callback=None, cancel_check=None):
-    """
-    指定フォルダ内のBMPファイルをJPEGに変換し、元のBMPファイルを削除する関数。
-    
-    Args:
-        progress_callback: 進捗を報告するコールバック関数 (current, total, message) -> None
-        cancel_check: キャンセル状態をチェックするコールバック関数 () -> bool
-    """
-    if not os.path.exists(folder):
-        print(f"Folder '{folder}' does not exist. No files were converted.")
-        return
-
-    # BMPファイルのリストを取得
-    bmp_files = [f for f in os.listdir(folder) if f.endswith(".bmp")]
-    total_files = len(bmp_files)
-    
-    for i, filename in enumerate(bmp_files):
-        # キャンセルチェック
-        if cancel_check and cancel_check():
-            print("圧縮処理がキャンセルされました")
-            if progress_callback:
-                progress_callback(i, total_files, "キャンセルされました")
-            return
-        
-        if progress_callback:
-            progress_callback(i, total_files, f"圧縮中: {filename}")
-            
-        bmp_path = os.path.join(folder, filename)
-        jpg_filename = filename.replace(".bmp", ".jpg")
-        jpg_path = os.path.join(folder, jpg_filename)
-
-        with Image.open(bmp_path) as img:
-            img = img.convert("RGB")
-            img.save(jpg_path, "JPEG", quality=quality)
-
-        print(f"Converted {filename} to {jpg_filename} with quality={quality}")
-
-        try:
-            os.unlink(bmp_path)
-            print(f"Deleted original BMP file: {filename}")
-        except Exception as e:
-            print(f"Failed to delete {filename}: {e}")
-
-    if progress_callback:
-        progress_callback(total_files, total_files, "圧縮完了")
-        
-    print("Conversion completed!")
-
-
-def select_folder_dialog():
+def _select_folder_dialog():
     """tkinterでフォルダ選択ダイアログを表示"""
     root = tk.Tk()
     root.withdraw()
@@ -230,7 +159,7 @@ def select_folder_dialog():
     return folder
 
 
-def select_file_dialog():
+def _select_file_dialog():
     """tkinterでファイル選択ダイアログを表示"""
     root = tk.Tk()
     root.withdraw()
@@ -248,862 +177,1006 @@ def select_file_dialog():
     return file
 
 
-def main(page: ft.Page):
-    # ページ設定
-    page.title = "タスク画像保存フロー"
-    page.window.width = 650
-    page.window.height = 700
-    page.window.min_width = 700
-    page.window.min_height = 550
-    page.padding = 0
-    page.theme_mode = ft.ThemeMode.LIGHT
-    
-    # Flet の window.icon でアイコンを設定
-    icon_png = _resolve_resource_path("icon_image.png")
-    if icon_png:
-        page.window.icon = icon_png
+# ---------------------------------------------------------------------------
+# 定数
+# ---------------------------------------------------------------------------
 
-    # Win32 API でタイトルバー・タスクバーアイコンを直接上書き
-    icon_ico = _resolve_resource_path("icon_image.ico")
-    _set_window_icon_win32(page.title, icon_ico)
-    page.theme = ft.Theme(
-        color_scheme_seed=ft.Colors.BLUE,
-        font_family="Yu Gothic UI",
-    )
+OPTION_DESCRIPTIONS = {
+    "option1": (
+        "現在の選択:\n\nVTV9000上のタスクから\n(オフラインPC)"
+        "\n\n━━━━━━━━━━━━━━━━\n\n"
+        "オフライン上にインストールされているVTV-9000内のタスクに格納されている"
+        "画像ファイルを任意のオプションで保存します。\n\n"
+        "タスクを保存しているグループ番号とタスク番号を入力してください。"
+    ),
+    "option2": (
+        "現在の選択:\n\nタスクファイルから\n(ziq, zit, zii)"
+        "\n\n━━━━━━━━━━━━━━━━\n\n"
+        "タスクファイル(ziq, zit, zii)に格納されている"
+        "画像ファイルを任意のオプションで保存します。\n\n"
+        "画像が格納されているタスクファイルを選択してください。"
+    ),
+    "option3": (
+        "現在の選択:\n\nVTV9000上のタスクから\n(共有VTV)"
+        "\n\n━━━━━━━━━━━━━━━━\n\n"
+        "ネットワーク上にインストールされているVTV-9000内のタスクに格納されている"
+        "画像ファイルを任意のオプションで保存します。\n\n"
+        "共有しているVTV-9000の「viscotech」フォルダを選択してください。\n"
+        "また共有VTV-900側の画像を保存しているグループ番号とタスク番号を入力してください。"
+    ),
+}
 
-    # 設定の読み込み
-    config = load_config()
 
-    # 状態変数
-    selected_option = ft.Ref[ft.RadioGroup]()
-    folder_path = ft.Ref[ft.TextField]()
-    file_path = ft.Ref[ft.TextField]()
-    group_num_field = ft.Ref[ft.TextField]()
-    task_num_field = ft.Ref[ft.TextField]()
-    option3_folder_field = ft.Ref[ft.TextField]()
-    warning_text = ft.Ref[ft.Text]()
-    info_text = ft.Ref[ft.Text]()
-    dynamic_content = ft.Ref[ft.Column]()
+# ---------------------------------------------------------------------------
+# アプリケーションクラス
+# ---------------------------------------------------------------------------
 
-    # 設定ダイアログ用の状態
-    save_mode_ref = ft.Ref[ft.RadioGroup]()
-    camera_mode_ref = ft.Ref[ft.RadioGroup]()
-    compression_slider_ref = ft.Ref[ft.Slider]()
-    compression_label_ref = ft.Ref[ft.Text]()
-    
-    # ファイル名テンプレート用
-    template1_ref = ft.Ref[ft.TextField]()  # コメントあり + 画像取込XX形式
-    template2_ref = ft.Ref[ft.TextField]()  # コメントあり + その他
-    template3_ref = ft.Ref[ft.TextField]()  # コメントなし
-    template1_preview_ref = ft.Ref[ft.Text]()
-    template2_preview_ref = ft.Ref[ft.Text]()
-    template3_preview_ref = ft.Ref[ft.Text]()
-    preview_comment_ref = ft.Ref[ft.TextField]()
-    preview_tool_capture_ref = ft.Ref[ft.TextField]()
-    preview_tool_other_ref = ft.Ref[ft.TextField]()
-    preview_original_ref = ft.Ref[ft.TextField]()
-    preview_cam_ref = ft.Ref[ft.TextField]()
-    preview_div_ref = ft.Ref[ft.TextField]()
-    preview_index_ref = ft.Ref[ft.TextField]()
-    preview_file_ref = ft.Ref[ft.TextField]()
-    
-    # 処理中フラグ（重複実行防止用）
-    app_state = {
-        'is_dialog_open': False
-    }
+class TaskImageSaverApp:
+    """タスク画像保存アプリケーション"""
 
-    # オプション説明テキスト
-    option_descriptions = {
-        "option1": "現在の選択:\n\nVTV9000上のタスクから\n(オフラインPC)\n\n━━━━━━━━━━━━━━━━\n\nオフライン上にインストールされているVTV-9000内のタスクに格納されている画像ファイルを任意のオプションで保存します。\n\nタスクを保存しているグループ番号とタスク番号を入力してください。",
-        "option2": "現在の選択:\n\nタスクファイルから\n(ziq, zit, zii)\n\n━━━━━━━━━━━━━━━━\n\nタスクファイル(ziq, zit, zii)に格納されている画像ファイルを任意のオプションで保存します。\n\n画像が格納されているタスクファイルを選択してください。",
-        "option3": "現在の選択:\n\nVTV9000上のタスクから\n(共有VTV)\n\n━━━━━━━━━━━━━━━━\n\nネットワーク上にインストールされているVTV-9000内のタスクに格納されている画像ファイルを任意のオプションで保存します。\n\n共有しているVTV-9000の「viscotech」フォルダを選択してください。\nまた共有VTV-900側の画像を保存しているグループ番号とタスク番号を入力してください。",
-    }
+    _ALLOWED_PLACEHOLDERS = {"comment", "tool", "original", "cam", "div", "index", "file"}
+    _PLACEHOLDER_PATTERN = re.compile(r"\{([a-zA-Z0-9_]+)(?::[^{}]+)?\}")
 
-    def show_message_dialog(title: str, message: str):
-        """メッセージダイアログを表示"""
-        def close_dialog(e):
+    def __init__(self, page: ft.Page):
+        self.page = page
+        self.config_manager = ConfigManager()
+        self.app_state = {'is_dialog_open': False}
+        self._processing_state = {}
+        self._current_img_folder = ""
+        self._current_output_folder = ""
+        self._progress_dialog = None
+        self._active_dialog = None
+
+        self._file_thumbnails = []
+        self._file_thumbnail_count = 0
+        self._preview_zip_path = ""
+        self._preview_bmp_names = []
+
+        self._init_refs()
+        self._setup_page()
+        self._build_ui()
+        self._update_dynamic_content()
+
+    # ==================================================================
+    # 初期化
+    # ==================================================================
+
+    def _init_refs(self):
+        """UI コントロールの Ref を初期化"""
+        self.selected_option = ft.Ref[ft.RadioGroup]()
+        self.folder_path = ft.Ref[ft.TextField]()
+        self.file_path = ft.Ref[ft.TextField]()
+        self.group_num_field = ft.Ref[ft.TextField]()
+        self.task_num_field = ft.Ref[ft.TextField]()
+        self.option3_folder_field = ft.Ref[ft.TextField]()
+        self.warning_text = ft.Ref[ft.Text]()
+        self.info_text = ft.Ref[ft.Text]()
+        self.dynamic_content = ft.Ref[ft.Column]()
+        self.thumbnail_row = ft.Ref[ft.Row]()
+        self.thumbnail_info = ft.Ref[ft.Text]()
+
+        # 設定ダイアログ用
+        self.save_mode_ref = ft.Ref[ft.RadioGroup]()
+        self.camera_mode_ref = ft.Ref[ft.RadioGroup]()
+        self.compression_slider_ref = ft.Ref[ft.Slider]()
+        self.compression_label_ref = ft.Ref[ft.Text]()
+
+        # テンプレート用
+        self.template1_ref = ft.Ref[ft.TextField]()
+        self.template2_ref = ft.Ref[ft.TextField]()
+        self.template3_ref = ft.Ref[ft.TextField]()
+        self.template1_preview_ref = ft.Ref[ft.Text]()
+        self.template2_preview_ref = ft.Ref[ft.Text]()
+        self.template3_preview_ref = ft.Ref[ft.Text]()
+        self.preview_comment_ref = ft.Ref[ft.TextField]()
+        self.preview_tool_capture_ref = ft.Ref[ft.TextField]()
+        self.preview_tool_other_ref = ft.Ref[ft.TextField]()
+        self.preview_original_ref = ft.Ref[ft.TextField]()
+        self.preview_cam_ref = ft.Ref[ft.TextField]()
+        self.preview_div_ref = ft.Ref[ft.TextField]()
+        self.preview_index_ref = ft.Ref[ft.TextField]()
+        self.preview_file_ref = ft.Ref[ft.TextField]()
+
+        # 進捗ダイアログ用
+        self.progress_bar_ref = ft.Ref[ft.ProgressBar]()
+        self.progress_text_ref = ft.Ref[ft.Text]()
+        self.progress_detail_ref = ft.Ref[ft.Text]()
+        self.progress_dialog_ref = ft.Ref[ft.AlertDialog]()
+
+    def _setup_page(self):
+        """ページの基本設定"""
+        self.page.title = "タスク画像保存フロー"
+        self.page.window.width = 650
+        self.page.window.height = 700
+        self.page.window.min_width = 700
+        self.page.window.min_height = 550
+        self.page.padding = 0
+        self.page.theme_mode = ft.ThemeMode.LIGHT
+
+        icon_png = _resolve_resource_path("icon_image.png")
+        if icon_png:
+            self.page.window.icon = icon_png
+
+        icon_ico = _resolve_resource_path("icon_image.ico")
+        _set_window_icon_win32(self.page.title, icon_ico)
+
+        self.page.theme = ft.Theme(
+            color_scheme_seed=ft.Colors.BLUE,
+            font_family="Yu Gothic UI",
+        )
+
+    # ==================================================================
+    # ダイアログ共通ヘルパー
+    # ==================================================================
+
+    def _add_dialog(self, dialog):
+        """ダイアログを表示（既存ダイアログは閉じる）"""
+        if self._active_dialog and self._active_dialog is not dialog:
+            self._close_all_dialogs()
+        self.page.show_dialog(dialog)
+        self._active_dialog = dialog
+        self.page.update()
+        self.page.schedule_update()
+
+    def _close_dialog(self, dialog):
+        """ダイアログを閉じる"""
+        if dialog is None:
+            return
+        try:
             dialog.open = False
-            page.update()
+            self.page.pop_dialog()
+        except Exception as e:
+            print(f"ダイアログclose更新エラー: {e}")
+        # show_dialog/pop_dialog 管理外で overlay に残ったものの保険
+        if dialog in self.page.overlay:
+            self.page.overlay.remove(dialog)
+        self.page.update()
+        self.page.schedule_update()
+        if self._active_dialog is dialog:
+            self._active_dialog = None
+
+    def _close_all_dialogs(self):
+        """表示中の全ダイアログを閉じる"""
+        while True:
+            try:
+                dlg = self.page.pop_dialog()
+            except Exception:
+                break
+            if dlg is None:
+                break
+        # show_dialog/pop_dialog 管理外で overlay に残ったものの保険
+        for d in list(self.page.overlay):
+            if isinstance(d, ft.AlertDialog):
+                d.open = False
+                self.page.overlay.remove(d)
+        self.page.update()
+        self.page.schedule_update()
+        self._progress_dialog = None
+        self._active_dialog = None
+        self.app_state['is_dialog_open'] = False
+
+    def _show_message_dialog(self, title: str, message: str):
+        """汎用メッセージダイアログ"""
+        dialog = None
+
+        def close(e):
+            self._close_dialog(dialog)
 
         dialog = ft.AlertDialog(
             modal=True,
             title=ft.Text(title),
             content=ft.Text(message),
-            actions=[
-                ft.TextButton("OK", on_click=close_dialog),
-            ],
+            actions=[ft.TextButton("OK", on_click=close)],
             actions_alignment=ft.MainAxisAlignment.END,
         )
-        page.overlay.append(dialog)
-        dialog.open = True
-        page.update()
+        self._add_dialog(dialog)
 
-    def show_success_dialog(output_folder_path: str):
+    def _show_success_dialog(self, output_folder_path: str):
         """保存完了ダイアログ（フォルダを開くボタン付き）"""
-        def close_dialog(e):
-            dialog.open = False
-            page.update()
+        dialog = None
+
+        def close(e):
+            print("成功ダイアログ: OKクリック")
+            self._close_all_dialogs()
+            print(f"成功ダイアログ: 全閉後 overlay件数={len(self.page.overlay)}")
 
         def open_folder(e):
-            try:
-                if output_folder_path and os.path.exists(output_folder_path):
-                    os.startfile(output_folder_path)  # Windowsでフォルダを開く
-                    # フォルダを開けたらダイアログも閉じる
-                    dialog.open = False
-                    page.update()
-                else:
-                    show_message_dialog("エラー", f"保存先フォルダが見つかりません:\n{output_folder_path}")
-            except Exception as ex:
-                show_message_dialog("エラー", f"保存先フォルダを開けませんでした:\n{type(ex).__name__}: {ex}")
+            print("成功ダイアログ: 保存先フォルダを開くクリック")
+            path = output_folder_path
+            if not path or not os.path.exists(path):
+                self._show_message_dialog(
+                    "エラー",
+                    f"保存先フォルダが見つかりません:\n{path}")
+                return
+
+            self._close_all_dialogs()
+            print(f"成功ダイアログ: 全閉後 overlay件数={len(self.page.overlay)}")
+            def _open():
+                try:
+                    os.startfile(path)
+                except Exception as ex:
+                    print(f"保存先フォルダを開けませんでした: {type(ex).__name__}: {ex}")
+            threading.Thread(target=_open, daemon=True).start()
 
         dialog = ft.AlertDialog(
             modal=True,
             title=ft.Text("画像保存フロー"),
-            content=ft.Column(
-                [
-                    ft.Text("画像が指定されたフォルダに保存されました。"),
-                    ft.Container(height=5),
-                    ft.Text(f"保存先: {output_folder_path}", size=11, color=ft.Colors.GREY_700),
-                ],
-                tight=True,
-                spacing=0,
-            ),
+            content=ft.Column([
+                ft.Text("画像が指定されたフォルダに保存されました。"),
+                ft.Container(height=5),
+                ft.Text(f"保存先: {output_folder_path}",
+                        size=11, color=ft.Colors.GREY_700),
+            ], tight=True, spacing=0),
             actions=[
                 ft.ElevatedButton("保存先フォルダを開く", on_click=open_folder),
-                ft.TextButton("OK", on_click=close_dialog),
+                ft.TextButton("OK", on_click=close),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
-        page.overlay.append(dialog)
-        dialog.open = True
-        page.update()
+        self._add_dialog(dialog)
 
-    def pick_folder(e):
-        """フォルダ選択ダイアログ"""
-        def select_and_update():
-            folder = select_folder_dialog()
+    # ==================================================================
+    # ファイル / フォルダ選択
+    # ==================================================================
+
+    def _pick_folder(self, e):
+        async def _run():
+            folder = await asyncio.to_thread(_select_folder_dialog)
             if folder:
-                folder_path.current.value = folder
-                warning_text.current.value = ""
-                page.update()
-        
-        # 別スレッドで実行してUIをブロックしない
-        threading.Thread(target=select_and_update, daemon=True).start()
+                self.folder_path.current.value = folder
+                self.warning_text.current.value = ""
+                self.page.update()
+        self.page.run_task(_run)
 
-    def pick_file(e):
-        """ファイル選択ダイアログ"""
-        def select_and_update():
-            file = select_file_dialog()
+    def _pick_file(self, e):
+        async def _run():
+            file = await asyncio.to_thread(_select_file_dialog)
             if file:
-                file_path.current.value = file
-                page.update()
-        
-        threading.Thread(target=select_and_update, daemon=True).start()
+                self.file_path.current.value = file
+                self._show_thumbnail_loading()
+                self.page.update()
+                total, thumbnails, bmp_names = await asyncio.to_thread(
+                    self._extract_preview_thumbnails, file)
+                self._file_thumbnails = thumbnails
+                self._file_thumbnail_count = total
+                self._preview_zip_path = file
+                self._preview_bmp_names = bmp_names
+                self._update_thumbnail_display()
+                self.page.update()
+        self.page.run_task(_run)
 
-    def pick_option3_folder(e):
-        """Option 3用フォルダ選択ダイアログ"""
-        def select_and_update():
-            folder = select_folder_dialog()
+    def _save_large_image_to_temp(self, bmp_index):
+        """zipから画像を取得し一時ファイルに保存してパスを返す"""
+        bmp_names = self._preview_bmp_names
+        try:
+            with zipfile.ZipFile(self._preview_zip_path, 'r') as zf:
+                with zf.open(bmp_names[bmp_index]) as img_data:
+                    img = Image.open(io.BytesIO(img_data.read()))
+                    img.thumbnail((460, 370), Image.LANCZOS)
+                    fd, tmp_path = tempfile.mkstemp(suffix='.jpg')
+                    os.close(fd)
+                    img.convert('RGB').save(tmp_path, 'JPEG', quality=85)
+                    return tmp_path
+        except Exception:
+            return None
+
+    def _show_enlarged_image(self, index):
+        """サムネイルクリック時にzipから拡大画像を取得してダイアログ表示する"""
+        if not self._file_thumbnails or not self._preview_zip_path:
+            return
+
+        bmp_names = self._preview_bmp_names
+        if not bmp_names:
+            return
+
+        tmp_path = self._save_large_image_to_temp(index)
+        if not tmp_path:
+            return
+
+        state = {"idx": index, "tmp": tmp_path}
+        dialog = None
+        img_ref = ft.Ref[ft.Image]()
+        counter_ref = ft.Ref[ft.Text]()
+
+        def update_view():
+            i = state["idx"]
+            old_tmp = state.get("tmp")
+            new_tmp = self._save_large_image_to_temp(i)
+            if new_tmp and img_ref.current:
+                img_ref.current.src = new_tmp
+                state["tmp"] = new_tmp
+            if counter_ref.current:
+                counter_ref.current.value = (
+                    f"{i + 1} / {len(bmp_names)}")
+            self.page.update()
+            if old_tmp and old_tmp != new_tmp:
+                try:
+                    os.remove(old_tmp)
+                except OSError:
+                    pass
+
+        def on_prev(e):
+            state["idx"] = (state["idx"] - 1) % len(bmp_names)
+            update_view()
+
+        def on_next(e):
+            state["idx"] = (state["idx"] + 1) % len(bmp_names)
+            update_view()
+
+        def on_close(e):
+            self.page.pop_dialog()
+            tmp = state.get("tmp")
+            if tmp:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+
+        total = len(bmp_names)
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("画像プレビュー", size=16,
+                          weight=ft.FontWeight.BOLD),
+            content=ft.Container(
+                width=480, height=420,
+                content=ft.Column([
+                    ft.Container(
+                        expand=True,
+                        alignment=ft.Alignment(0, 0),
+                        content=ft.Image(
+                            ref=img_ref,
+                            src=tmp_path,
+                            width=460, height=370,
+                        ),
+                    ),
+                    ft.Row([
+                        ft.IconButton(
+                            icon=ft.Icons.ARROW_BACK,
+                            on_click=on_prev,
+                            disabled=(total <= 1)),
+                        ft.Text(
+                            ref=counter_ref,
+                            value=f"{index + 1} / {total}",
+                            size=13, weight=ft.FontWeight.W_500),
+                        ft.IconButton(
+                            icon=ft.Icons.ARROW_FORWARD,
+                            on_click=on_next,
+                            disabled=(total <= 1)),
+                    ], alignment=ft.MainAxisAlignment.CENTER),
+                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                   spacing=5),
+            ),
+            actions=[ft.TextButton("閉じる", on_click=on_close)],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        self.page.show_dialog(dialog)
+
+    def _extract_preview_thumbnails(self, zip_path, max_images=6,
+                                     thumb_size=(100, 100)):
+        """タスクファイル(zip)から最初のtxtに紐づく代表画像のサムネイルを取得する。
+        ファイルを展開せずにzip内を直接読み取る。並列処理で高速化。"""
+        thumbnails = []
+        bmp_names_out = []
+        total = 0
+
+        def _process_one_bmp(args):
+            """1枚のBMPをサムネイル化（並列実行用）"""
+            idx, full_path = args
+            try:
+                with zipfile.ZipFile(zip_path, 'r') as zf:
+                    with zf.open(full_path) as img_data:
+                        img = Image.open(io.BytesIO(img_data.read()))
+                        img.thumbnail(thumb_size, Image.BILINEAR)
+                        buf = io.BytesIO()
+                        img.convert('RGB').save(buf, format='JPEG', quality=65)
+                        return (idx, buf.getvalue(), full_path)
+            except Exception:
+                return (idx, None, full_path)
+
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                all_names = [n.replace('\\', '/') for n in zf.namelist()]
+
+                img_prefix = None
+                for n in all_names:
+                    if '/img/' in n:
+                        idx = n.index('/img/')
+                        img_prefix = n[:idx + 5]
+                        break
+                if not img_prefix:
+                    return total, thumbnails, bmp_names_out
+
+                txt_files = sorted([
+                    n for n in all_names
+                    if n.startswith(img_prefix)
+                    and n.lower().endswith('.txt')
+                ])
+                if not txt_files:
+                    return total, thumbnails, bmp_names_out
+
+                first_txt = txt_files[0]
+                referenced_bmps = []
+                with zf.open(first_txt) as f:
+                    for raw_line in f:
+                        line = raw_line.decode('utf-8', errors='ignore')
+                        if 'FILE=' in line:
+                            bmp_name = line.split('FILE=', 1)[1].strip()
+                            referenced_bmps.append(bmp_name)
+
+                total = len(referenced_bmps)
+                if not referenced_bmps:
+                    return total, thumbnails, bmp_names_out
+
+                step = max(1, len(referenced_bmps) // max_images)
+                selected = referenced_bmps[::step][:max_images]
+
+                bmp_lookup = {}
+                for n in all_names:
+                    if n.startswith(img_prefix) and n.lower().endswith('.bmp'):
+                        bmp_lookup[n.rsplit('/', 1)[-1]] = n
+
+                to_process = []
+                for i, bmp_basename in enumerate(selected):
+                    full_path = bmp_lookup.get(bmp_basename)
+                    if full_path:
+                        to_process.append((i, full_path))
+
+            if not to_process:
+                return total, thumbnails, bmp_names_out
+
+            # 並列でサムネイル生成（最大6スレッド）
+            results = [None] * len(to_process)
+            with ThreadPoolExecutor(max_workers=min(6, len(to_process))) as ex:
+                futures = {ex.submit(_process_one_bmp, item): item[0]
+                          for item in to_process}
+                for future in as_completed(futures):
+                    idx, thumb_bytes, full_path = future.result()
+                    if thumb_bytes:
+                        results[idx] = (thumb_bytes, full_path)
+
+            thumbnails = [r[0] for r in results if r is not None]
+            bmp_names_out = [r[1] for r in results if r is not None]
+
+        except Exception as ex:
+            print(f"サムネイル取得エラー: {ex}")
+        return total, thumbnails, bmp_names_out
+
+    def _show_thumbnail_loading(self):
+        """サムネイル領域にローディング表示をセットする"""
+        row = self.thumbnail_row.current
+        if not row:
+            return
+        row.controls.clear()
+        row.alignment = ft.MainAxisAlignment.CENTER
+        row.controls.append(
+            ft.Row([
+                ft.ProgressRing(width=16, height=16, stroke_width=2),
+                ft.Text("プレビュー読み込み中...",
+                        size=11, color=ft.Colors.GREY_500),
+            ], spacing=8, alignment=ft.MainAxisAlignment.CENTER)
+        )
+
+    def _load_file_thumbnails(self, file_path):
+        """選択されたタスクファイルの代表画像サムネイルを読み込んで表示"""
+        total, thumbnails, bmp_names = self._extract_preview_thumbnails(
+            file_path)
+        self._file_thumbnails = thumbnails
+        self._file_thumbnail_count = total
+        self._preview_zip_path = file_path
+        self._preview_bmp_names = bmp_names
+        self._update_thumbnail_display()
+
+    def _update_thumbnail_display(self):
+        """サムネイル行コントロールを現在のキャッシュで更新する"""
+        row = self.thumbnail_row.current
+        info = self.thumbnail_info.current
+        if not row:
+            return
+
+        row.controls.clear()
+        if self._file_thumbnails:
+            row.alignment = ft.MainAxisAlignment.START
+            for i, img_bytes in enumerate(self._file_thumbnails):
+                row.controls.append(
+                    ft.Container(
+                        content=ft.Image(
+                            src=img_bytes, width=100, height=100,
+                        ),
+                        border=ft.border.all(1, ft.Colors.GREY_300),
+                        border_radius=6, padding=2,
+                        bgcolor=ft.Colors.WHITE,
+                        on_click=lambda e, idx=i: self._show_enlarged_image(idx),
+                        ink=True,
+                    )
+                )
+        else:
+            row.alignment = ft.MainAxisAlignment.CENTER
+            if self._file_thumbnail_count == 0 and info:
+                row.controls.append(
+                    ft.Text("画像が見つかりませんでした",
+                            size=11, color=ft.Colors.GREY_400, italic=True)
+                )
+
+        if info:
+            if self._file_thumbnail_count > 0:
+                info.value = (
+                    f"代表画像プレビュー"
+                    f" ({self._file_thumbnail_count}枚の画像を検出):")
+            else:
+                info.value = "代表画像プレビュー:"
+
+    def _pick_option3_folder(self, e):
+        async def _run():
+            folder = await asyncio.to_thread(_select_folder_dialog)
             if folder:
-                option3_folder_field.current.value = folder
-                config["option3_folder"] = folder
-                save_config(config)
-                page.update()
-        
-        threading.Thread(target=select_and_update, daemon=True).start()
+                self.option3_folder_field.current.value = folder
+                self.config_manager.set("option3_folder", folder)
+                self.config_manager.save()
+                self.page.update()
+        self.page.run_task(_run)
 
-    def update_dynamic_content(e=None):
-        """ラジオボタンの選択に応じて動的コンテンツを更新"""
-        option = selected_option.current.value if selected_option.current else "option1"
-        
-        # 情報パネルの更新
-        info_text.current.value = option_descriptions.get(option, "")
-        
-        # 動的コンテンツのクリア
-        dynamic_content.current.controls.clear()
+    # ==================================================================
+    # 動的コンテンツ（ラジオ切替で表示変更）
+    # ==================================================================
+
+    def _update_dynamic_content(self, e=None):
+        option = (self.selected_option.current.value
+                  if self.selected_option.current else "option1")
+        self.info_text.current.value = OPTION_DESCRIPTIONS.get(option, "")
+        self.dynamic_content.current.controls.clear()
+        self._file_thumbnails = []
+        self._file_thumbnail_count = 0
+        self._preview_zip_path = ""
+        self._preview_bmp_names = []
 
         if option == "option1":
-            # Option 1: グループ番号とタスク番号
-            dynamic_content.current.controls.extend([
-                ft.Row([
-                    ft.Text("グループ番号:", width=100, size=13),
-                    ft.TextField(
-                        ref=group_num_field,
-                        expand=True,
-                        hint_text="例: 1",
-                        border_radius=6,
-                        content_padding=ft.padding.only(left=10, right=10, top=6, bottom=6),
-                        text_size=13,
-                    ),
-                    ft.Container(width=93),  # 参照ボタンと揃えるためのスペーサー
-                ]),
-                ft.Row([
-                    ft.Text("タスク番号:", width=100, size=13),
-                    ft.TextField(
-                        ref=task_num_field,
-                        expand=True,
-                        hint_text="例: 1",
-                        border_radius=6,
-                        content_padding=ft.padding.only(left=10, right=10, top=6, bottom=6),
-                        text_size=13,
-                    ),
-                    ft.Container(width=93),  # 参照ボタンと揃えるためのスペーサー
-                ]),
-            ])
+            self.dynamic_content.current.controls.extend(
+                self._build_group_task_fields())
         elif option == "option2":
-            # Option 2: ファイル選択
-            dynamic_content.current.controls.extend([
-                ft.Text("ファイル選択 (ziq, zit, zii):", size=13),
-                ft.Row([
-                    ft.TextField(
-                        ref=file_path,
-                        expand=True,
-                        hint_text="タスクファイルを選択...",
-                        border_radius=6,
-                        content_padding=ft.padding.only(left=10, right=10, top=6, bottom=6),
-                        text_size=13,
-                    ),
-                    ft.ElevatedButton(
-                        "参照",
-                        icon=ft.Icons.FOLDER_OPEN,
-                        on_click=pick_file,
-                    ),
-                ]),
-            ])
+            self.dynamic_content.current.controls.extend(
+                self._build_option2_fields())
         elif option == "option3":
-            # Option 3: グループ番号、タスク番号、共有フォルダ
-            dynamic_content.current.controls.extend([
-                ft.Row([
-                    ft.Text("グループ番号:", width=100, size=13),
-                    ft.TextField(
-                        ref=group_num_field,
-                        expand=True,
-                        hint_text="例: 1",
-                        border_radius=6,
-                        content_padding=ft.padding.only(left=10, right=10, top=6, bottom=6),
-                        text_size=13,
-                    ),
-                    ft.Container(width=93),  # 参照ボタンと揃えるためのスペーサー
-                ]),
-                ft.Row([
-                    ft.Text("タスク番号:", width=100, size=13),
-                    ft.TextField(
-                        ref=task_num_field,
-                        expand=True,
-                        hint_text="例: 1",
-                        border_radius=6,
-                        content_padding=ft.padding.only(left=10, right=10, top=6, bottom=6),
-                        text_size=13,
-                    ),
-                    ft.Container(width=93),  # 参照ボタンと揃えるためのスペーサー
-                ]),
-                ft.Container(height=5),
-                ft.Text("共有VTVフォルダ選択:", size=13),
-                ft.Row([
-                    ft.TextField(
-                        ref=option3_folder_field,
-                        expand=True,
-                        value=config.get("option3_folder", ""),
-                        hint_text="viscotechフォルダを選択...",
-                        border_radius=6,
-                        content_padding=ft.padding.only(left=10, right=10, top=6, bottom=6),
-                        text_size=13,
-                    ),
-                    ft.ElevatedButton(
-                        "参照",
-                        icon=ft.Icons.FOLDER_OPEN,
-                        on_click=pick_option3_folder,
-                    ),
-                ]),
-            ])
+            self.dynamic_content.current.controls.extend(
+                self._build_option3_fields())
+        self.page.update()
 
-        page.update()
+    def _build_group_task_fields(self):
+        """グループ番号・タスク番号入力フィールドを生成"""
+        return [
+            ft.Row([
+                ft.Text("グループ番号:", width=100, size=13),
+                ft.TextField(
+                    ref=self.group_num_field, expand=True, hint_text="例: 1",
+                    border_radius=6, text_size=13,
+                    content_padding=ft.padding.only(
+                        left=10, right=10, top=6, bottom=6),
+                ),
+                ft.Container(width=93),
+            ]),
+            ft.Row([
+                ft.Text("タスク番号:", width=100, size=13),
+                ft.TextField(
+                    ref=self.task_num_field, expand=True, hint_text="例: 1",
+                    border_radius=6, text_size=13,
+                    content_padding=ft.padding.only(
+                        left=10, right=10, top=6, bottom=6),
+                ),
+                ft.Container(width=93),
+            ]),
+        ]
 
-    def update_compression_label(e):
-        """圧縮率ラベルを更新"""
-        if compression_slider_ref.current and compression_label_ref.current:
-            value = int(compression_slider_ref.current.value)
-            compression_label_ref.current.value = f"現在の値: {value}"
-            page.update()
+    def _build_option2_fields(self):
+        thumbnail_controls = []
+        for i, img_bytes in enumerate(self._file_thumbnails):
+            thumbnail_controls.append(
+                ft.Container(
+                    content=ft.Image(
+                        src=img_bytes, width=100, height=100,
+                    ),
+                    border=ft.border.all(1, ft.Colors.GREY_300),
+                    border_radius=6, padding=2,
+                    bgcolor=ft.Colors.WHITE,
+                    on_click=lambda e, idx=i: self._show_enlarged_image(idx),
+                    ink=True,
+                )
+            )
 
-    def show_settings_dialog(img_folder_path: str, output_folder: str):
-        """設定ダイアログを表示"""
-        
-        # ダイアログを開いていることをマーク
-        app_state['is_dialog_open'] = True
+        if not thumbnail_controls:
+            thumbnail_controls.append(
+                ft.Text("ファイルを選択すると代表画像が表示されます",
+                        size=11, color=ft.Colors.GREY_400, italic=True)
+            )
 
-        # プレビュー用サンプル値（YYMMDDhhmmssSSS）
-        now = datetime.now()
-        preview_original_default = f"{now.strftime('%y%m%d%H%M%S')}{now.microsecond // 1000:03d}"
-        
-        # 進捗ダイアログ用のRef
-        progress_bar_ref = ft.Ref[ft.ProgressBar]()
-        progress_text_ref = ft.Ref[ft.Text]()
-        progress_detail_ref = ft.Ref[ft.Text]()
-        progress_dialog_ref = ft.Ref[ft.AlertDialog]()
-        
-        # 処理状態を管理
-        processing_state = {
-            'is_processing': False,
-            'current': 0,
-            'total': 0,
-            'message': '準備中...',
-            'completed': False,
-            'error': None,
-            'started': False,  # 重複実行防止フラグ
-            'cancelled': False,  # キャンセルフラグ
-            'created_files': [],  # 処理中に作成されたファイルのリスト
-            'output_folder': ''  # 出力フォルダパス
-        }
-        
-        def show_progress_dialog():
-            """進捗ダイアログを表示"""
-            
-            def on_cancel_click(e):
-                """キャンセルボタンクリック時の処理"""
-                processing_state['cancelled'] = True
-                processing_state['message'] = 'キャンセル中...'
-                print("キャンセルボタンがクリックされました")
-                # ボタンを無効化
-                if e.control:
-                    e.control.disabled = True
-                    e.control.text = "キャンセル中..."
-                    page.update()
-            
-            progress_dialog = ft.AlertDialog(
-                ref=progress_dialog_ref,
-                modal=True,
-                title=ft.Text("画像処理中", size=16, weight=ft.FontWeight.BOLD),
-                content=ft.Container(
-                    width=350,
+        info_text = "代表画像プレビュー:"
+        if self._file_thumbnail_count > 0:
+            info_text = (
+                f"代表画像プレビュー"
+                f" ({self._file_thumbnail_count}枚の画像を検出):")
+
+        return [
+            ft.Text("ファイル選択 (ziq, zit, zii):", size=13),
+            ft.Row([
+                ft.TextField(
+                    ref=self.file_path, expand=True,
+                    hint_text="タスクファイルを選択...",
+                    border_radius=6, text_size=13,
+                    content_padding=ft.padding.only(
+                        left=10, right=10, top=6, bottom=6),
+                ),
+                ft.ElevatedButton(
+                    "参照", icon=ft.Icons.FOLDER_OPEN,
+                    on_click=self._pick_file),
+            ]),
+            ft.Container(height=5),
+            ft.Text(
+                ref=self.thumbnail_info, value=info_text,
+                size=12, color=ft.Colors.GREY_700),
+            ft.Container(
+                content=ft.Row(
+                    ref=self.thumbnail_row,
+                    controls=thumbnail_controls,
+                    spacing=8, wrap=True,
+                    alignment=(
+                        ft.MainAxisAlignment.CENTER
+                        if not self._file_thumbnails
+                        else ft.MainAxisAlignment.START),
+                ),
+                height=120,
+                border=ft.border.all(1, ft.Colors.GREY_200),
+                border_radius=8, padding=8,
+                bgcolor=ft.Colors.GREY_50,
+                alignment=ft.Alignment(0, 0),
+            ),
+        ]
+
+    def _build_option3_fields(self):
+        fields = self._build_group_task_fields()
+        fields.extend([
+            ft.Container(height=5),
+            ft.Text("共有VTVフォルダ選択:", size=13),
+            ft.Row([
+                ft.TextField(
+                    ref=self.option3_folder_field, expand=True,
+                    value=self.config_manager.get("option3_folder", ""),
+                    hint_text="viscotechフォルダを選択...",
+                    border_radius=6, text_size=13,
+                    content_padding=ft.padding.only(
+                        left=10, right=10, top=6, bottom=6),
+                ),
+                ft.ElevatedButton(
+                    "参照", icon=ft.Icons.FOLDER_OPEN,
+                    on_click=self._pick_option3_folder),
+            ]),
+        ])
+        return fields
+
+    # ==================================================================
+    # テンプレートヘルパー
+    # ==================================================================
+
+    def _extract_unknown_placeholders(self, template: str):
+        if not template:
+            return []
+        names = {m.group(1) for m in self._PLACEHOLDER_PATTERN.finditer(str(template))}
+        return sorted(n for n in names if n not in self._ALLOWED_PLACEHOLDERS)
+
+    @staticmethod
+    def _parse_int_from_textfield(tf: ft.TextField, default_value: int):
+        if tf is None:
+            return default_value
+        raw = (tf.value or "").strip()
+        if raw == "":
+            tf.error_text = None
+            return default_value
+        try:
+            tf.error_text = None
+            return int(raw)
+        except Exception:
+            tf.error_text = "数値を入力してください"
+            return default_value
+
+    def _build_preview(self, template: str, condition: int):
+        """テンプレートのプレビュー文字列を生成（condition: 1/2/3）"""
+        sample_comment = (
+            self.preview_comment_ref.current.value
+            if self.preview_comment_ref.current else "ng") or "ng"
+        sample_tool_capture = (
+            self.preview_tool_capture_ref.current.value
+            if self.preview_tool_capture_ref.current else "画像取込01") or "画像取込01"
+        sample_tool_other = (
+            self.preview_tool_other_ref.current.value
+            if self.preview_tool_other_ref.current else "ToolA") or "ToolA"
+        sample_original = (
+            self.preview_original_ref.current.value
+            if self.preview_original_ref.current
+            else "260120115606036_1_1") or "260120115606036_1_1"
+        sample_cam = self._parse_int_from_textfield(
+            self.preview_cam_ref.current, 1)
+        sample_div = self._parse_int_from_textfield(
+            self.preview_div_ref.current, 2)
+        sample_index = self._parse_int_from_textfield(
+            self.preview_index_ref.current, 3)
+        sample_file = (
+            self.preview_file_ref.current.value
+            if self.preview_file_ref.current
+            else "260120115606036") or "260120115606036"
+
+        tool_value = sample_tool_capture if condition == 1 else sample_tool_other
+        comment_value = sample_comment if condition in (1, 2) else ""
+
+        try:
+            return save_task_images_CamNum_selection.apply_filename_template(
+                template=template or "",
+                comment=comment_value,
+                tool_comment=tool_value,
+                original_name=sample_original,
+                cam=sample_cam,
+                div=sample_div,
+                index=sample_index,
+                file_source=sample_file,
+            )
+        except Exception:
+            return ""
+
+    def _refresh_template_previews(self):
+        """テンプレートプレビューとバリデーションを更新"""
+        if not (self.template1_ref.current and self.template2_ref.current
+                and self.template3_ref.current):
+            return
+
+        t1 = self.template1_ref.current.value or ""
+        t2 = self.template2_ref.current.value or ""
+        t3 = self.template3_ref.current.value or ""
+
+        for tf, template in (
+            (self.template1_ref.current, t1),
+            (self.template2_ref.current, t2),
+            (self.template3_ref.current, t3),
+        ):
+            unknown = self._extract_unknown_placeholders(template)
+            if unknown:
+                tf.error_text = ("未対応のプレースホルダー: "
+                                 + ", ".join(f"{{{n}}}" for n in unknown))
+            else:
+                tf.error_text = None
+
+        if self.template1_preview_ref.current:
+            self.template1_preview_ref.current.value = (
+                f"プレビュー: {self._build_preview(t1, 1)}.bmp")
+        if self.template2_preview_ref.current:
+            self.template2_preview_ref.current.value = (
+                f"プレビュー: {self._build_preview(t2, 2)}.bmp")
+        if self.template3_preview_ref.current:
+            self.template3_preview_ref.current.value = (
+                f"プレビュー: {self._build_preview(t3, 3)}.bmp")
+
+        self.page.update()
+
+    def _on_template_change(self, e):
+        self._refresh_template_previews()
+
+    def _build_template_section(self, preview_original_default: str):
+        """出力ファイル名テンプレートの ExpansionTile を構築"""
+        on_change = self._on_template_change
+
+        return ft.ExpansionTile(
+            title=ft.Text("出力ファイル名テンプレート",
+                          size=13, weight=ft.FontWeight.W_500),
+            expanded=False,
+            controls_padding=ft.Padding(left=10, right=10, top=0, bottom=10),
+            controls=[
+                ft.Container(
+                    bgcolor=ft.Colors.GREY_50, padding=10, border_radius=8,
                     content=ft.Column([
-                        ft.Text(
-                            ref=progress_text_ref,
-                            value="準備中...",
-                            size=13,
+                        # 条件1
+                        ft.Text("条件1: コメントあり + 画像取込XX形式",
+                                size=11, color=ft.Colors.GREY_700),
+                        ft.TextField(
+                            ref=self.template1_ref, value="{comment}_{index}",
+                            dense=True, text_size=12,
+                            content_padding=ft.padding.symmetric(
+                                horizontal=10, vertical=8),
+                            on_change=on_change,
                         ),
-                        ft.Container(height=10),
-                        ft.ProgressBar(
-                            ref=progress_bar_ref,
-                            value=0,
-                            width=330,
-                            bar_height=8,
+                        ft.Text(ref=self.template1_preview_ref,
+                                value="プレビュー: ",
+                                size=10, color=ft.Colors.GREY_700),
+                        ft.Container(height=4),
+                        # 条件2
+                        ft.Text("条件2: コメントあり + その他のツールコメント",
+                                size=11, color=ft.Colors.GREY_700),
+                        ft.TextField(
+                            ref=self.template2_ref, value="{comment}_{tool}",
+                            dense=True, text_size=12,
+                            content_padding=ft.padding.symmetric(
+                                horizontal=10, vertical=8),
+                            on_change=on_change,
+                        ),
+                        ft.Text(ref=self.template2_preview_ref,
+                                value="プレビュー: ",
+                                size=10, color=ft.Colors.GREY_700),
+                        ft.Container(height=4),
+                        # 条件3
+                        ft.Text("条件3: コメントなし",
+                                size=11, color=ft.Colors.GREY_700),
+                        ft.TextField(
+                            ref=self.template3_ref, value="{original}",
+                            dense=True, text_size=12,
+                            content_padding=ft.padding.symmetric(
+                                horizontal=10, vertical=8),
+                            on_change=on_change,
+                        ),
+                        ft.Text(ref=self.template3_preview_ref,
+                                value="プレビュー: ",
+                                size=10, color=ft.Colors.GREY_700),
+                        ft.Container(height=8),
+                        # プレースホルダー説明
+                        ft.Container(
+                            bgcolor=ft.Colors.BLUE_50, padding=8,
                             border_radius=4,
+                            content=ft.Column([
+                                ft.Text("使用可能なプレースホルダー:",
+                                        size=10, weight=ft.FontWeight.W_500),
+                                ft.Text("{comment} - 画像コメント", size=10),
+                                ft.Text("{tool} - ツールコメント", size=10),
+                                ft.Text("{original} - 元ファイル名", size=10),
+                                ft.Text("{cam} - カメラ番号", size=10),
+                                ft.Text("{div} - DIV番号（列番号）", size=10),
+                                ft.Text("{index} - 連番", size=10),
+                                ft.Text("{file} - 参照元テキストファイル名",
+                                        size=10),
+                            ], spacing=2),
                         ),
-                        ft.Container(height=5),
-                        ft.Text(
-                            ref=progress_detail_ref,
-                            value="0 / 0 ファイル",
-                            size=11,
-                            color=ft.Colors.GREY_600,
+                        ft.Container(height=8),
+                        # プレビュー用サンプル値
+                        ft.Container(
+                            bgcolor=ft.Colors.GREY_100, padding=8,
+                            border_radius=6,
+                            content=ft.Column([
+                                ft.Text(
+                                    "プレビュー用サンプル値"
+                                    "（変更するとプレビューが更新されます）",
+                                    size=10, weight=ft.FontWeight.W_500,
+                                    color=ft.Colors.GREY_800,
+                                ),
+                                ft.Row([
+                                    ft.TextField(
+                                        ref=self.preview_comment_ref,
+                                        label="comment", value="ng",
+                                        dense=True, text_size=11, expand=True,
+                                        content_padding=ft.padding.symmetric(
+                                            horizontal=10, vertical=8),
+                                        on_change=on_change,
+                                    ),
+                                    ft.TextField(
+                                        ref=self.preview_original_ref,
+                                        label="original",
+                                        value=preview_original_default,
+                                        dense=True, text_size=11, expand=True,
+                                        content_padding=ft.padding.symmetric(
+                                            horizontal=10, vertical=8),
+                                        on_change=on_change,
+                                    ),
+                                ], spacing=8),
+                                ft.Row([
+                                    ft.TextField(
+                                        ref=self.preview_tool_capture_ref,
+                                        label="tool(画像取込)",
+                                        value="画像取込01",
+                                        dense=True, text_size=11, expand=True,
+                                        content_padding=ft.padding.symmetric(
+                                            horizontal=10, vertical=8),
+                                        on_change=on_change,
+                                    ),
+                                    ft.TextField(
+                                        ref=self.preview_tool_other_ref,
+                                        label="tool(その他)", value="ToolA",
+                                        dense=True, text_size=11, expand=True,
+                                        content_padding=ft.padding.symmetric(
+                                            horizontal=10, vertical=8),
+                                        on_change=on_change,
+                                    ),
+                                ], spacing=8),
+                                ft.Row([
+                                    ft.TextField(
+                                        ref=self.preview_cam_ref,
+                                        label="cam", value="1",
+                                        dense=True, text_size=11, expand=True,
+                                        content_padding=ft.padding.symmetric(
+                                            horizontal=10, vertical=8),
+                                        on_change=on_change,
+                                    ),
+                                    ft.TextField(
+                                        ref=self.preview_div_ref,
+                                        label="div", value="2",
+                                        dense=True, text_size=11, expand=True,
+                                        content_padding=ft.padding.symmetric(
+                                            horizontal=10, vertical=8),
+                                        on_change=on_change,
+                                    ),
+                                    ft.TextField(
+                                        ref=self.preview_index_ref,
+                                        label="index", value="3",
+                                        dense=True, text_size=11, expand=True,
+                                        content_padding=ft.padding.symmetric(
+                                            horizontal=10, vertical=8),
+                                        on_change=on_change,
+                                    ),
+                                ], spacing=8),
+                                ft.Row([
+                                    ft.TextField(
+                                        ref=self.preview_file_ref,
+                                        label="file（参照元テキストファイル名）",
+                                        value="260120115606036",
+                                        dense=True, text_size=11, expand=True,
+                                        content_padding=ft.padding.symmetric(
+                                            horizontal=10, vertical=8),
+                                        on_change=on_change,
+                                    ),
+                                ], spacing=8),
+                            ], spacing=6),
                         ),
-                    ],
-                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                    ),
+                    ], spacing=4),
                 ),
-                actions=[
-                    ft.OutlinedButton(
-                        "キャンセル",
-                        on_click=on_cancel_click,
-                        style=ft.ButtonStyle(
-                            color=ft.Colors.RED_700,
-                        ),
-                    ),
-                ],
-                actions_alignment=ft.MainAxisAlignment.CENTER,
-            )
-            page.overlay.append(progress_dialog)
-            progress_dialog.open = True
-            page.update()
-            return progress_dialog
-        
-        def update_progress_ui():
-            """UIを更新する"""
-            try:
-                if progress_bar_ref.current and progress_text_ref.current and progress_detail_ref.current:
-                    progress = processing_state['current'] / processing_state['total'] if processing_state['total'] > 0 else 0
-                    progress_bar_ref.current.value = progress
-                    progress_text_ref.current.value = processing_state['message']
-                    progress_detail_ref.current.value = f"{processing_state['current']} / {processing_state['total']} ファイル"
-            except Exception as e:
-                print(f"UI更新エラー: {e}")
-        
-        def update_progress(current, total, message):
-            """進捗を更新（別スレッドから呼び出される）"""
-            processing_state['current'] = current
-            processing_state['total'] = total
-            processing_state['message'] = message
-            print(f"進捗: {current}/{total} - {message}")
-        
-        def close_progress_dialog():
-            """進捗ダイアログを閉じる"""
-            processing_state['is_processing'] = False
-            try:
-                if progress_dialog_ref.current:
-                    progress_dialog_ref.current.open = False
-            except Exception as e:
-                print(f"ダイアログ閉じエラー: {e}")
-        
-        def show_cancel_confirm_dialog(created_files, output_folder_path):
-            """キャンセル時の確認ダイアログを表示"""
-            file_count = len(created_files)
-            
-            def delete_files(e):
-                """ファイルを削除"""
-                confirm_dialog.open = False
-                page.update()
-                
-                deleted_count = 0
-                for filename in created_files:
-                    file_path = os.path.join(output_folder_path, filename)
-                    try:
-                        if os.path.exists(file_path):
-                            os.unlink(file_path)
-                            deleted_count += 1
-                            print(f"削除: {filename}")
-                    except Exception as ex:
-                        print(f"削除失敗: {filename} - {ex}")
-                
-                show_message_dialog("キャンセル完了", f"処理がキャンセルされました。\n{deleted_count}件のファイルを削除しました。")
-            
-            def keep_files(e):
-                """ファイルを保持"""
-                confirm_dialog.open = False
-                page.update()
-                show_message_dialog("キャンセル完了", f"処理がキャンセルされました。\n{file_count}件のファイルは保存先に残っています。")
-            
-            confirm_dialog = ft.AlertDialog(
-                modal=True,
-                title=ft.Text("キャンセル確認", size=16, weight=ft.FontWeight.BOLD),
-                content=ft.Container(
-                    width=350,
-                    content=ft.Column([
-                        ft.Text("処理がキャンセルされました。", size=13),
-                        ft.Container(height=10),
-                        ft.Text(f"既に {file_count} 件のファイルが保存されています。", size=13),
-                        ft.Container(height=5),
-                        ft.Text("これらのファイルを削除しますか？", size=13, weight=ft.FontWeight.W_500),
-                    ]),
-                ),
-                actions=[
-                    ft.ElevatedButton(
-                        "削除する",
-                        bgcolor=ft.Colors.RED_600,
-                        color=ft.Colors.WHITE,
-                        on_click=delete_files,
-                    ),
-                    ft.OutlinedButton(
-                        "残す",
-                        on_click=keep_files,
-                    ),
-                ],
-                actions_alignment=ft.MainAxisAlignment.END,
-            )
-            
-            page.overlay.append(confirm_dialog)
-            confirm_dialog.open = True
-            page.update()
-        
-        async def progress_monitor_async():
-            """進捗を監視してUIを更新する(非同期版)"""
-            print("監視タスク開始")
-            loop_count = 0
-            
-            # 処理が完了するまでUIを更新し続ける
-            while True:
-                update_progress_ui()
-                page.update()
-                loop_count += 1
-                
-                # 5回ごとに状態をログ出力
-                if loop_count % 5 == 0:
-                    print(f"監視タスク: ループ{loop_count}回目 - is_processing={processing_state['is_processing']}, completed={processing_state['completed']}, error={processing_state['error']}")
-                
-                # 処理が完了、エラー、またはキャンセルの場合、ループを抜ける
-                if not processing_state['is_processing']:
-                    print(f"監視タスク: is_processing=False を検知 - completed={processing_state['completed']}, error={processing_state['error']}, cancelled={processing_state['cancelled']}")
-                    if processing_state['completed'] or processing_state['error'] or processing_state['cancelled']:
-                        print("監視タスク: ループを抜けます")
-                        break
-                    else:
-                        print("監視タスク: completedもerrorもcancelledも設定されていないため、待機を継続")
-                
-                await asyncio.sleep(0.1)  # 100msごとにUIを更新
-            
-            print("監視タスク: 処理完了を検知、最終処理開始")
-            
-            # 処理完了後の最終更新
-            update_progress_ui()
-            page.update()
-            await asyncio.sleep(0.2)
-            
-            # 完了/エラー/キャンセル処理
-            if processing_state['cancelled']:
-                print("監視タスク: キャンセル処理")
-                close_progress_dialog()
-                page.update()
-                
-                # 作成されたファイルがある場合は確認ダイアログを表示
-                created_files = processing_state.get('created_files', [])
-                output_folder_path = processing_state.get('output_folder', '')
-                if created_files and output_folder_path:
-                    print(f"作成されたファイル: {len(created_files)}件 - 確認ダイアログを表示")
-                    show_cancel_confirm_dialog(created_files, output_folder_path)
-                else:
-                    show_message_dialog("キャンセル", "処理がキャンセルされました。")
-            elif processing_state['error']:
-                print(f"監視タスク: エラー処理 - {processing_state['error']}")
-                close_progress_dialog()
-                page.update()
-                show_message_dialog("エラー", f"処理中にエラーが発生しました:\n{processing_state['error']}")
-            elif processing_state['completed']:
-                print("監視タスク: 完了処理")
-                close_progress_dialog()
-                page.update()
-                show_success_dialog(processing_state.get('output_folder', ''))
-            
-            # 次回の実行を許可するためにフラグをリセット
-            processing_state['started'] = False
-            app_state['is_dialog_open'] = False
-            print("監視タスク終了")
-        
-        def execute_image_processing(save_mode, save_cam, compression, selected_cam_list=None, filename_templates=None):
-            """画像処理を実行"""
-            
-            # 重複実行を防止
-            if processing_state['started']:
-                print("警告: 処理は既に開始されています。重複実行をスキップします。")
-                return
-            processing_state['started'] = True
-            
-            # デフォルトのテンプレート
-            if filename_templates is None:
-                filename_templates = {
-                    'template1': "{comment}_{index}",
-                    'template2': "{comment}_{tool}",
-                    'template3': "{original}",
-                }
-            
-            def check_cancelled():
-                """キャンセル状態をチェック"""
-                return processing_state['cancelled']
-            
-            def run_processing():
-                """別スレッドで画像処理を実行"""
-                print(f"処理スレッド開始: img_folder={img_folder_path}, output={output_folder}")
-                try:
-                    # 画像処理を実行（事前選択されたカメラリストとテンプレートを渡す）
-                    save_task_images_CamNum_selection.process_images(
-                        img_folder_path, output_folder, save_mode, save_cam, 
-                        preselected_cam_list=selected_cam_list,
-                        progress_callback=update_progress,
-                        filename_templates=filename_templates,
-                        cancel_check=check_cancelled
-                    )
-                    
-                    # キャンセルされた場合は完了フラグを立てない
-                    if processing_state['cancelled']:
-                        print("処理スレッド: キャンセルされました")
-                        return
-                    
-                    print("画像処理完了")
+            ],
+        )
 
-                    # 圧縮処理
-                    if 0 < compression < 100:
-                        print("圧縮処理開始")
-                        convert_bmp_to_jpeg(output_folder, compression, progress_callback=update_progress, cancel_check=check_cancelled)
-                        
-                        # キャンセルされた場合は完了フラグを立てない
-                        if processing_state['cancelled']:
-                            print("処理スレッド: 圧縮中にキャンセルされました")
-                            return
-                        
-                        print("圧縮処理完了")
-                    
-                    print("処理スレッド: completed = True を設定")
-                    processing_state['completed'] = True
-                    
-                except Exception as ex:
-                    # キャンセルによる例外は無視
-                    if processing_state['cancelled']:
-                        print("処理スレッド: キャンセルによる中断")
-                        return
-                    
-                    # エラーの詳細をコンソールに出力
-                    print("=" * 50)
-                    print("エラーが発生しました:")
-                    traceback.print_exc()
-                    print("=" * 50)
-                    
-                    processing_state['error'] = f"{type(ex).__name__}: {ex}"
-                
-                finally:
-                    # 新しく作成されたファイルを特定
-                    if os.path.exists(output_folder):
-                        current_files = set(os.listdir(output_folder))
-                        new_files = current_files - processing_state.get('existing_files', set())
-                        processing_state['created_files'] = list(new_files)
-                        print(f"新しく作成されたファイル: {len(new_files)}件")
-                    
-                    print(f"処理スレッド終了: completed={processing_state['completed']}, error={processing_state['error']}, cancelled={processing_state['cancelled']}")
-                    processing_state['is_processing'] = False
-            
-            # 状態を初期化
-            processing_state['is_processing'] = True
-            processing_state['current'] = 0
-            processing_state['total'] = 0
-            processing_state['message'] = '準備中...'
-            processing_state['completed'] = False
-            processing_state['error'] = None
-            processing_state['cancelled'] = False
-            processing_state['created_files'] = []
-            processing_state['output_folder'] = output_folder
-            # started はここではリセットしない（重複防止のため）
-            
-            # 処理開始前の既存ファイルリストを記録
-            existing_files = set()
-            if os.path.exists(output_folder):
-                existing_files = set(os.listdir(output_folder))
-            processing_state['existing_files'] = existing_files
-            
-            # 進捗ダイアログを表示
-            show_progress_dialog()
-            
-            # 別スレッドで処理を実行
-            threading.Thread(target=run_processing, daemon=True).start()
-            
-            # 非同期で進捗監視タスクを実行（メインスレッドでUI更新）
-            page.run_task(progress_monitor_async)
-        
-        def show_camera_selection_dialog(save_mode, compression, filename_templates):
-            """カメラ選択ダイアログを表示"""
-            # カメラリストを取得
-            camera_arrays = save_task_images_CamNum_selection.get_camera_list(img_folder_path)
-            
-            if not camera_arrays:
-                show_message_dialog("エラー", "カメラリストを取得できませんでした。")
-                return
-            
-            # 2次元配列をラベルとチェックボックスのパラメータに変換
-            labels_dict = defaultdict(list)
-            for key, value in camera_arrays:
-                labels_dict[key].append(value)
-            label_params = [f"カメラ {key}" for key in labels_dict.keys()]
-            checkbox_params = [values for values in labels_dict.values()]
-            
-            # 選択状態を管理
-            selected_items = {i: checkbox_params[i][:] for i in range(len(checkbox_params))}
-            checkbox_refs_dict = {i: [] for i in range(len(checkbox_params))}
-            
-            def on_checkbox_change(label_index, item, value):
-                if value:
-                    if item not in selected_items[label_index]:
-                        selected_items[label_index].append(item)
-                else:
-                    if item in selected_items[label_index]:
-                        selected_items[label_index].remove(item)
-            
-            def select_all(label_index):
-                selected_items[label_index] = checkbox_params[label_index][:]
-                for cb in checkbox_refs_dict[label_index]:
-                    cb.value = True
-                page.update()
-            
-            def deselect_all(label_index):
-                selected_items[label_index] = []
-                for cb in checkbox_refs_dict[label_index]:
-                    cb.value = False
-                page.update()
-            
-            def on_camera_ok(e):
-                result_list = []
-                for i, items in selected_items.items():
-                    for item in items:
-                        result_list.append([i + 1, item])
-                camera_dialog.open = False
-                page.update()
-                execute_image_processing(save_mode, "1", compression, result_list, filename_templates=filename_templates)
-            
-            def on_camera_cancel(e):
-                camera_dialog.open = False
-                app_state['is_dialog_open'] = False
-                page.update()
-            
-            # カメラごとのカラムを作成
-            camera_columns = []
-            for i, (label_text, items) in enumerate(zip(label_params, checkbox_params)):
-                checkboxes = []
-                for item in items:
-                    cb = ft.Checkbox(
-                        label=str(item),
-                        value=True,
-                        on_change=lambda e, idx=i, itm=item: on_checkbox_change(idx, itm, e.control.value),
-                    )
-                    checkbox_refs_dict[i].append(cb)
-                    checkboxes.append(cb)
-                
-                camera_container = ft.Container(
-                    bgcolor=ft.Colors.GREY_100,
-                    border_radius=8,
-                    padding=10,
-                    width=150,
-                    content=ft.Column([
-                        ft.Text(label_text, size=13, weight=ft.FontWeight.W_500),
-                        ft.Divider(height=1),
-                        ft.Row([
-                            ft.TextButton("全選択", on_click=lambda e, idx=i: select_all(idx)),
-                            ft.TextButton("解除", on_click=lambda e, idx=i: deselect_all(idx)),
-                        ], spacing=0),
-                        ft.Column(checkboxes, scroll=ft.ScrollMode.AUTO, height=200, spacing=0),
-                    ], spacing=5),
-                )
-                camera_columns.append(camera_container)
-            
-            camera_dialog = ft.AlertDialog(
-                modal=True,
-                title=ft.Text("カメラ・列番号選択", size=16, weight=ft.FontWeight.BOLD),
-                content=ft.Container(
-                    width=min(len(camera_columns) * 160, 600),
-                    content=ft.Column([
-                        ft.Text("保存したいカメラ番号、列番号を選択してください", size=12),
-                        ft.Container(height=5),
-                        ft.Row(camera_columns, scroll=ft.ScrollMode.AUTO, spacing=10),
-                    ]),
-                ),
-                actions=[
-                    ft.ElevatedButton("OK", bgcolor=ft.Colors.BLUE, color=ft.Colors.WHITE, on_click=on_camera_ok),
-                    ft.OutlinedButton("キャンセル", on_click=on_camera_cancel),
-                ],
-                actions_alignment=ft.MainAxisAlignment.END,
-            )
-            
-            page.overlay.append(camera_dialog)
-            camera_dialog.open = True
-            page.update()
-        
-        allowed_placeholders = {"comment", "tool", "original", "cam", "div", "index", "file"}
-        placeholder_pattern = re.compile(r"\{([a-zA-Z0-9_]+)(?::[^{}]+)?\}")
+    # ==================================================================
+    # 設定ダイアログ
+    # ==================================================================
 
-        def extract_unknown_placeholders(template: str):
-            """未対応プレースホルダーを抽出（{name} / {name:03} 形式対応）"""
-            if not template:
-                return []
-            names = {m.group(1) for m in placeholder_pattern.finditer(str(template))}
-            unknown = sorted([n for n in names if n not in allowed_placeholders])
-            return unknown
+    def _update_compression_label(self, e):
+        if self.compression_slider_ref.current and self.compression_label_ref.current:
+            value = int(self.compression_slider_ref.current.value)
+            self.compression_label_ref.current.value = f"現在の値: {value}"
+            self.page.update()
 
-        def _parse_int_from_textfield(tf: ft.TextField, default_value: int):
-            """TextFieldからintを取得。不正ならerror_textを出してデフォルトにフォールバック。"""
-            if tf is None:
-                return default_value
-            raw = (tf.value or "").strip()
-            if raw == "":
-                tf.error_text = None
-                return default_value
-            try:
-                tf.error_text = None
-                return int(raw)
-            except Exception:
-                tf.error_text = "数値を入力してください"
-                return default_value
+    def _show_settings_dialog(self, img_folder_path: str, output_folder: str):
+        """設定ダイアログを表示"""
+        self.app_state['is_dialog_open'] = True
+        self._current_img_folder = img_folder_path
+        self._current_output_folder = output_folder
 
-        def build_preview(template: str, condition: int):
-            """
-            テンプレートのプレビュー文字列を生成。
-            condition:
-              1=コメントあり+画像取込XX, 2=コメントあり+その他, 3=コメントなし
-            """
-            # サンプル値（ユーザー入力があればそれを使用）
-            sample_comment = (preview_comment_ref.current.value if preview_comment_ref.current else "ng") or "ng"
-            sample_tool_capture = (preview_tool_capture_ref.current.value if preview_tool_capture_ref.current else "画像取込01") or "画像取込01"
-            sample_tool_other = (preview_tool_other_ref.current.value if preview_tool_other_ref.current else "ToolA") or "ToolA"
-            sample_original = (preview_original_ref.current.value if preview_original_ref.current else "260120115606036_1_1") or "260120115606036_1_1"
-            sample_cam = _parse_int_from_textfield(preview_cam_ref.current, 1)
-            sample_div = _parse_int_from_textfield(preview_div_ref.current, 2)
-            sample_index = _parse_int_from_textfield(preview_index_ref.current, 3)
-            sample_file = (preview_file_ref.current.value if preview_file_ref.current else "260120115606036") or "260120115606036"
+        now = datetime.now()
+        preview_original_default = (
+            f"{now.strftime('%y%m%d%H%M%S')}{now.microsecond // 1000:03d}")
 
-            tool_value = sample_tool_capture if condition == 1 else sample_tool_other
-            comment_value = sample_comment if condition in (1, 2) else ""
+        self._processing_state = {
+            'is_processing': False, 'current': 0, 'total': 0,
+            'message': '準備中...', 'completed': False, 'error': None,
+            'started': False, 'cancelled': False, 'created_files': [],
+            'output_folder': '', 'existing_files': set(),
+        }
 
-            # 実処理と同じ置換ロジックを使用
-            try:
-                return save_task_images_CamNum_selection.apply_filename_template(
-                    template=template or "",
-                    comment=comment_value,
-                    tool_comment=tool_value,
-                    original_name=sample_original,
-                    cam=sample_cam,
-                    div=sample_div,
-                    index=sample_index,
-                    file_source=sample_file,
-                )
-            except Exception:
-                # 例外が出た場合はそのまま返す（UIが落ちないように）
-                return ""
+        settings_dialog = None
 
-        def refresh_template_previews():
-            """テンプレートプレビューとバリデーションを更新（リアルタイム）"""
-            if not (template1_ref.current and template2_ref.current and template3_ref.current):
-                return
-
-            t1 = template1_ref.current.value or ""
-            t2 = template2_ref.current.value or ""
-            t3 = template3_ref.current.value or ""
-
-            # 未対応プレースホルダー検知 → error_text に出す
-            for tf, template in (
-                (template1_ref.current, t1),
-                (template2_ref.current, t2),
-                (template3_ref.current, t3),
-            ):
-                unknown = extract_unknown_placeholders(template)
-                if unknown:
-                    tf.error_text = "未対応のプレースホルダー: " + ", ".join([f"{{{n}}}" for n in unknown])
-                else:
-                    tf.error_text = None
-
-            # プレビュー更新
-            if template1_preview_ref.current:
-                template1_preview_ref.current.value = f"プレビュー: {build_preview(t1, 1)}.bmp"
-            if template2_preview_ref.current:
-                template2_preview_ref.current.value = f"プレビュー: {build_preview(t2, 2)}.bmp"
-            if template3_preview_ref.current:
-                template3_preview_ref.current.value = f"プレビュー: {build_preview(t3, 3)}.bmp"
-
-            page.update()
-
-        def on_template_change(e):
-            refresh_template_previews()
-
-        def on_settings_ok(e):
-            """設定ダイアログOK"""
-            save_mode = save_mode_ref.current.value
-            save_cam = camera_mode_ref.current.value
-            compression = int(compression_slider_ref.current.value)
-            
-            # ファイル名テンプレートを取得
+        def on_ok(e):
+            save_mode = self.save_mode_ref.current.value
+            save_cam = self.camera_mode_ref.current.value
+            compression = int(self.compression_slider_ref.current.value)
             filename_templates = {
-                'template1': template1_ref.current.value if template1_ref.current else "{comment}_{index}",
-                'template2': template2_ref.current.value if template2_ref.current else "{comment}_{tool}",
-                'template3': template3_ref.current.value if template3_ref.current else "{original}",
+                'template1': (self.template1_ref.current.value
+                              if self.template1_ref.current
+                              else "{comment}_{index}"),
+                'template2': (self.template2_ref.current.value
+                              if self.template2_ref.current
+                              else "{comment}_{tool}"),
+                'template3': (self.template3_ref.current.value
+                              if self.template3_ref.current
+                              else "{original}"),
             }
-            
-            settings_dialog.open = False
-            page.update()
+            self._close_dialog(settings_dialog)
 
             if save_cam == "1":
-                # カメラ選択ダイアログを表示
-                show_camera_selection_dialog(save_mode, compression, filename_templates)
+                self._show_camera_selection_dialog(
+                    save_mode, compression, filename_templates)
             else:
-                # 全てのカメラを保存
-                execute_image_processing(save_mode, save_cam, compression, filename_templates=filename_templates)
+                self._execute_image_processing(
+                    save_mode, "0", compression, None, filename_templates)
 
-        def on_settings_cancel(e):
-            """設定ダイアログキャンセル"""
-            settings_dialog.open = False
-            app_state['is_dialog_open'] = False
-            page.update()
+        def on_cancel(e):
+            self._close_dialog(settings_dialog)
+            self.app_state['is_dialog_open'] = False
 
         settings_dialog = ft.AlertDialog(
             modal=True,
@@ -1111,60 +1184,46 @@ def main(page: ft.Page):
             content=ft.Container(
                 width=420,
                 content=ft.Column([
-                    # 保存モード
                     ft.Text("保存モード", size=13, weight=ft.FontWeight.W_500),
                     ft.Container(
-                        bgcolor=ft.Colors.GREY_50,
-                        padding=10,
-                        border_radius=8,
+                        bgcolor=ft.Colors.GREY_50, padding=10, border_radius=8,
                         content=ft.RadioGroup(
-                            ref=save_mode_ref,
-                            value="0",
+                            ref=self.save_mode_ref, value="0",
                             content=ft.Column([
                                 ft.Radio(value="0", label="全ての画像を保存"),
-                                ft.Radio(value="1", label="コメント付き画像を保存"),
+                                ft.Radio(value="1",
+                                         label="コメント付き画像を保存"),
                                 ft.Radio(value="2", label="ロック画像を保存"),
-                            ],
-                            spacing=2,
-                            ),
+                            ], spacing=2),
                         ),
                     ),
                     ft.Container(height=8),
 
-                    # カメラ列保存モード
-                    ft.Text("カメラ列保存モード", size=13, weight=ft.FontWeight.W_500),
+                    ft.Text("カメラ列保存モード",
+                            size=13, weight=ft.FontWeight.W_500),
                     ft.Container(
-                        bgcolor=ft.Colors.GREY_50,
-                        padding=10,
-                        border_radius=8,
+                        bgcolor=ft.Colors.GREY_50, padding=10, border_radius=8,
                         content=ft.RadioGroup(
-                            ref=camera_mode_ref,
-                            value="0",
+                            ref=self.camera_mode_ref, value="0",
                             content=ft.Column([
                                 ft.Radio(value="0", label="全てのカメラ列"),
-                                ft.Radio(value="1", label="保存するカメラ列を選択"),
-                            ],
-                            spacing=2,
-                            ),
+                                ft.Radio(value="1",
+                                         label="保存するカメラ列を選択"),
+                            ], spacing=2),
                         ),
                     ),
                     ft.Container(height=8),
 
-                    # 圧縮率
-                    ft.Text("圧縮率を選択 (100は元画像(bmp)で保存)", size=13, weight=ft.FontWeight.W_500),
+                    ft.Text("圧縮率を選択 (100は元画像(bmp)で保存)",
+                            size=13, weight=ft.FontWeight.W_500),
                     ft.Container(
-                        bgcolor=ft.Colors.GREY_50,
-                        padding=10,
-                        border_radius=8,
+                        bgcolor=ft.Colors.GREY_50, padding=10, border_radius=8,
                         content=ft.Column([
                             ft.Slider(
-                                ref=compression_slider_ref,
-                                min=10,
-                                max=100,
-                                divisions=9,
-                                value=100,
+                                ref=self.compression_slider_ref,
+                                min=10, max=100, divisions=9, value=100,
                                 label="{value}",
-                                on_change=update_compression_label,
+                                on_change=self._update_compression_label,
                             ),
                             ft.Row([
                                 ft.Text("10", size=11),
@@ -1172,568 +1231,732 @@ def main(page: ft.Page):
                                 ft.Text("100", size=11),
                             ]),
                             ft.Text(
-                                ref=compression_label_ref,
-                                value="現在の値: 100",
-                                size=11,
+                                ref=self.compression_label_ref,
+                                value="現在の値: 100", size=11,
                                 color=ft.Colors.GREY_700,
                             ),
-                        ],
-                        spacing=2,
-                        ),
+                        ], spacing=2),
                     ),
                     ft.Container(height=8),
 
-                    # 出力ファイル名テンプレート
-                    ft.ExpansionTile(
-                        title=ft.Text("出力ファイル名テンプレート", size=13, weight=ft.FontWeight.W_500),
-                        expanded=False,
-                        controls_padding=ft.Padding(left=10, right=10, top=0, bottom=10),
-                        controls=[
-                            ft.Container(
-                                bgcolor=ft.Colors.GREY_50,
-                                padding=10,
-                                border_radius=8,
-                                content=ft.Column([
-                                    # 条件1: コメントあり + 画像取込XX形式
-                                    ft.Text("条件1: コメントあり + 画像取込XX形式", size=11, color=ft.Colors.GREY_700),
-                                    ft.TextField(
-                                        ref=template1_ref,
-                                        value="{comment}_{index}",
-                                        dense=True,
-                                        text_size=12,
-                                        content_padding=ft.padding.symmetric(horizontal=10, vertical=8),
-                                        on_change=on_template_change,
-                                    ),
-                                    ft.Text(
-                                        ref=template1_preview_ref,
-                                        value="プレビュー: ",
-                                        size=10,
-                                        color=ft.Colors.GREY_700,
-                                    ),
-                                    ft.Container(height=4),
-                                    
-                                    # 条件2: コメントあり + その他
-                                    ft.Text("条件2: コメントあり + その他のツールコメント", size=11, color=ft.Colors.GREY_700),
-                                    ft.TextField(
-                                        ref=template2_ref,
-                                        value="{comment}_{tool}",
-                                        dense=True,
-                                        text_size=12,
-                                        content_padding=ft.padding.symmetric(horizontal=10, vertical=8),
-                                        on_change=on_template_change,
-                                    ),
-                                    ft.Text(
-                                        ref=template2_preview_ref,
-                                        value="プレビュー: ",
-                                        size=10,
-                                        color=ft.Colors.GREY_700,
-                                    ),
-                                    ft.Container(height=4),
-                                    
-                                    # 条件3: コメントなし
-                                    ft.Text("条件3: コメントなし", size=11, color=ft.Colors.GREY_700),
-                                    ft.TextField(
-                                        ref=template3_ref,
-                                        value="{original}",
-                                        dense=True,
-                                        text_size=12,
-                                        content_padding=ft.padding.symmetric(horizontal=10, vertical=8),
-                                        on_change=on_template_change,
-                                    ),
-                                    ft.Text(
-                                        ref=template3_preview_ref,
-                                        value="プレビュー: ",
-                                        size=10,
-                                        color=ft.Colors.GREY_700,
-                                    ),
-                                    ft.Container(height=8),
-                                    
-                                    # プレースホルダー説明
-                                    ft.Container(
-                                        bgcolor=ft.Colors.BLUE_50,
-                                        padding=8,
-                                        border_radius=4,
-                                        content=ft.Column([
-                                            ft.Text("使用可能なプレースホルダー:", size=10, weight=ft.FontWeight.W_500),
-                                            ft.Text("{comment} - 画像コメント", size=10),
-                                            ft.Text("{tool} - ツールコメント", size=10),
-                                            ft.Text("{original} - 元ファイル名", size=10),
-                                            ft.Text("{cam} - カメラ番号", size=10),
-                                            ft.Text("{div} - DIV番号（列番号）", size=10),
-                                            ft.Text("{index} - 連番", size=10),
-                                            ft.Text("{file} - 参照元テキストファイル名", size=10),
-                                        ],
-                                        spacing=2,
-                                        ),
-                                    ),
-                            ft.Container(height=8),
-
-                            # プレビュー用サンプル値（変更するとプレビューが更新されます）
-                            ft.Container(
-                                bgcolor=ft.Colors.GREY_100,
-                                padding=8,
-                                border_radius=6,
-                                content=ft.Column(
-                                    [
-                                        ft.Text(
-                                            "プレビュー用サンプル値（変更するとプレビューが更新されます）",
-                                            size=10,
-                                            weight=ft.FontWeight.W_500,
-                                            color=ft.Colors.GREY_800,
-                                        ),
-                                        ft.Row(
-                                            [
-                                                ft.TextField(
-                                                    ref=preview_comment_ref,
-                                                    label="comment",
-                                                    value="ng",
-                                                    dense=True,
-                                                    text_size=11,
-                                                    content_padding=ft.padding.symmetric(horizontal=10, vertical=8),
-                                                    expand=True,
-                                                    on_change=on_template_change,
-                                                ),
-                                                ft.TextField(
-                                                    ref=preview_original_ref,
-                                                    label="original",
-                                                    value=preview_original_default,
-                                                    dense=True,
-                                                    text_size=11,
-                                                    content_padding=ft.padding.symmetric(horizontal=10, vertical=8),
-                                                    expand=True,
-                                                    on_change=on_template_change,
-                                                ),
-                                            ],
-                                            spacing=8,
-                                        ),
-                                        ft.Row(
-                                            [
-                                                ft.TextField(
-                                                    ref=preview_tool_capture_ref,
-                                                    label="tool(画像取込)",
-                                                    value="画像取込01",
-                                                    dense=True,
-                                                    text_size=11,
-                                                    content_padding=ft.padding.symmetric(horizontal=10, vertical=8),
-                                                    expand=True,
-                                                    on_change=on_template_change,
-                                                ),
-                                                ft.TextField(
-                                                    ref=preview_tool_other_ref,
-                                                    label="tool(その他)",
-                                                    value="ToolA",
-                                                    dense=True,
-                                                    text_size=11,
-                                                    content_padding=ft.padding.symmetric(horizontal=10, vertical=8),
-                                                    expand=True,
-                                                    on_change=on_template_change,
-                                                ),
-                                            ],
-                                            spacing=8,
-                                        ),
-                                        ft.Row(
-                                            [
-                                                ft.TextField(
-                                                    ref=preview_cam_ref,
-                                                    label="cam",
-                                                    value="1",
-                                                    dense=True,
-                                                    text_size=11,
-                                                    content_padding=ft.padding.symmetric(horizontal=10, vertical=8),
-                                                    expand=True,
-                                                    on_change=on_template_change,
-                                                ),
-                                                ft.TextField(
-                                                    ref=preview_div_ref,
-                                                    label="div",
-                                                    value="2",
-                                                    dense=True,
-                                                    text_size=11,
-                                                    content_padding=ft.padding.symmetric(horizontal=10, vertical=8),
-                                                    expand=True,
-                                                    on_change=on_template_change,
-                                                ),
-                                                ft.TextField(
-                                                    ref=preview_index_ref,
-                                                    label="index",
-                                                    value="3",
-                                                    dense=True,
-                                                    text_size=11,
-                                                    content_padding=ft.padding.symmetric(horizontal=10, vertical=8),
-                                                    expand=True,
-                                                    on_change=on_template_change,
-                                                ),
-                                            ],
-                                            spacing=8,
-                                        ),
-                                        ft.Row(
-                                            [
-                                                ft.TextField(
-                                                    ref=preview_file_ref,
-                                                    label="file（参照元テキストファイル名）",
-                                                    value="260120115606036",
-                                                    dense=True,
-                                                    text_size=11,
-                                                    content_padding=ft.padding.symmetric(horizontal=10, vertical=8),
-                                                    expand=True,
-                                                    on_change=on_template_change,
-                                                ),
-                                            ],
-                                            spacing=8,
-                                        ),
-                                    ],
-                                    spacing=6,
-                                ),
-                            ),
-                                ],
-                                spacing=4,
-                                ),
-                            ),
-                        ],
-                    ),
-                ],
-                scroll=ft.ScrollMode.AUTO,
-                spacing=5,
-                ),
+                    self._build_template_section(preview_original_default),
+                ], scroll=ft.ScrollMode.AUTO, spacing=5),
             ),
             actions=[
                 ft.ElevatedButton(
-                    "OK",
-                    bgcolor=ft.Colors.BLUE,
-                    color=ft.Colors.WHITE,
-                    on_click=on_settings_ok,
-                ),
-                ft.OutlinedButton(
-                    "キャンセル",
-                    on_click=on_settings_cancel,
-                ),
+                    "OK", bgcolor=ft.Colors.BLUE,
+                    color=ft.Colors.WHITE, on_click=on_ok),
+                ft.OutlinedButton("キャンセル", on_click=on_cancel),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
 
-        page.overlay.append(settings_dialog)
-        settings_dialog.open = True
-        # 初回表示時にプレビューを計算
-        refresh_template_previews()
-        page.update()
+        self._add_dialog(settings_dialog)
+        self._refresh_template_previews()
 
-    def on_ok_click(e):
+    # ==================================================================
+    # カメラ選択ダイアログ
+    # ==================================================================
+
+    def _show_camera_selection_dialog(self, save_mode, compression,
+                                     filename_templates):
+        """カメラ選択ダイアログを表示"""
+        camera_arrays = save_task_images_CamNum_selection.get_camera_list(
+            self._current_img_folder)
+
+        if not camera_arrays:
+            self._show_message_dialog("エラー",
+                                     "カメラリストを取得できませんでした。")
+            return
+
+        labels_dict = defaultdict(list)
+        for key, value in camera_arrays:
+            labels_dict[key].append(value)
+        label_params = [f"カメラ {key}" for key in labels_dict.keys()]
+        checkbox_params = [values for values in labels_dict.values()]
+
+        selected_items = {i: checkbox_params[i][:]
+                         for i in range(len(checkbox_params))}
+        checkbox_refs_dict = {i: [] for i in range(len(checkbox_params))}
+
+        def on_checkbox_change(label_index, item, value):
+            if value:
+                if item not in selected_items[label_index]:
+                    selected_items[label_index].append(item)
+            else:
+                if item in selected_items[label_index]:
+                    selected_items[label_index].remove(item)
+
+        def select_all(label_index):
+            selected_items[label_index] = checkbox_params[label_index][:]
+            for cb in checkbox_refs_dict[label_index]:
+                cb.value = True
+            self.page.update()
+
+        def deselect_all(label_index):
+            selected_items[label_index] = []
+            for cb in checkbox_refs_dict[label_index]:
+                cb.value = False
+            self.page.update()
+
+        camera_dialog = None
+
+        def on_ok(e):
+            result_list = []
+            for i, items in selected_items.items():
+                for item in items:
+                    result_list.append([i + 1, item])
+            self._close_dialog(camera_dialog)
+            self._execute_image_processing(
+                save_mode, "1", compression, result_list, filename_templates)
+
+        def on_cancel(e):
+            self._close_dialog(camera_dialog)
+            self.app_state['is_dialog_open'] = False
+
+        camera_columns = []
+        for i, (label_text, items) in enumerate(
+                zip(label_params, checkbox_params)):
+            checkboxes = []
+            for item in items:
+                cb = ft.Checkbox(
+                    label=str(item), value=True,
+                    on_change=lambda e, idx=i, itm=item:
+                        on_checkbox_change(idx, itm, e.control.value),
+                )
+                checkbox_refs_dict[i].append(cb)
+                checkboxes.append(cb)
+
+            camera_container = ft.Container(
+                bgcolor=ft.Colors.GREY_100, border_radius=8,
+                padding=10, width=150,
+                content=ft.Column([
+                    ft.Text(label_text, size=13, weight=ft.FontWeight.W_500),
+                    ft.Divider(height=1),
+                    ft.Row([
+                        ft.TextButton(
+                            "全選択",
+                            on_click=lambda e, idx=i: select_all(idx)),
+                        ft.TextButton(
+                            "解除",
+                            on_click=lambda e, idx=i: deselect_all(idx)),
+                    ], spacing=0),
+                    ft.Column(checkboxes, scroll=ft.ScrollMode.AUTO,
+                              height=200, spacing=0),
+                ], spacing=5),
+            )
+            camera_columns.append(camera_container)
+
+        camera_dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("カメラ・列番号選択",
+                          size=16, weight=ft.FontWeight.BOLD),
+            content=ft.Container(
+                width=min(len(camera_columns) * 160, 600),
+                content=ft.Column([
+                    ft.Text("保存したいカメラ番号、列番号を選択してください",
+                            size=12),
+                    ft.Container(height=5),
+                    ft.Row(camera_columns,
+                           scroll=ft.ScrollMode.AUTO, spacing=10),
+                ]),
+            ),
+            actions=[
+                ft.ElevatedButton(
+                    "OK", bgcolor=ft.Colors.BLUE,
+                    color=ft.Colors.WHITE, on_click=on_ok),
+                ft.OutlinedButton("キャンセル", on_click=on_cancel),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+
+        self._add_dialog(camera_dialog)
+
+    # ==================================================================
+    # 進捗管理 & 画像処理
+    # ==================================================================
+
+    def _show_progress_dialog(self):
+        """進捗ダイアログを表示"""
+        def on_cancel_click(e):
+            self._processing_state['cancelled'] = True
+            self._processing_state['message'] = 'キャンセル中...'
+            print("キャンセルボタンがクリックされました")
+            if e.control:
+                e.control.disabled = True
+                e.control.text = "キャンセル中..."
+                self.page.update()
+
+        progress_dialog = ft.AlertDialog(
+            ref=self.progress_dialog_ref,
+            modal=True,
+            title=ft.Text("画像処理中", size=16, weight=ft.FontWeight.BOLD),
+            content=ft.Container(
+                width=350,
+                content=ft.Column([
+                    ft.Text(ref=self.progress_text_ref,
+                            value="準備中...", size=13),
+                    ft.Container(height=10),
+                    ft.ProgressBar(
+                        ref=self.progress_bar_ref,
+                        value=0, width=330, bar_height=8, border_radius=4),
+                    ft.Container(height=5),
+                    ft.Text(ref=self.progress_detail_ref,
+                            value="0 / 0 ファイル",
+                            size=11, color=ft.Colors.GREY_600),
+                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+            ),
+            actions=[
+                ft.OutlinedButton(
+                    "キャンセル", on_click=on_cancel_click,
+                    style=ft.ButtonStyle(color=ft.Colors.RED_700)),
+            ],
+            actions_alignment=ft.MainAxisAlignment.CENTER,
+        )
+        self._progress_dialog = progress_dialog
+        self._add_dialog(progress_dialog)
+
+    def _update_progress_ui(self):
+        try:
+            if (self.progress_bar_ref.current
+                    and self.progress_text_ref.current
+                    and self.progress_detail_ref.current):
+                ps = self._processing_state
+                total = ps['total']
+                progress = ps['current'] / total if total > 0 else 0
+                self.progress_bar_ref.current.value = progress
+                self.progress_text_ref.current.value = ps['message']
+                self.progress_detail_ref.current.value = (
+                    f"{ps['current']} / {total} ファイル")
+        except Exception as e:
+            print(f"UI更新エラー: {e}")
+
+    def _update_progress(self, current, total, message):
+        """進捗を更新（別スレッドから呼び出される）"""
+        self._processing_state['current'] = current
+        self._processing_state['total'] = total
+        self._processing_state['message'] = message
+        print(f"進捗: {current}/{total} - {message}")
+
+    def _close_progress_dialog(self):
+        """進捗ダイアログを overlay から除去（page.update は呼び出し元で行う）"""
+        self._processing_state['is_processing'] = False
+        try:
+            dialog = self._progress_dialog or self.progress_dialog_ref.current
+            if not dialog:
+                for d in self.page.overlay:
+                    if isinstance(d, ft.AlertDialog):
+                        title = getattr(getattr(d, "title", None), "value", "")
+                        if title == "画像処理中":
+                            dialog = d
+                            break
+            if dialog:
+                self._close_dialog(dialog)
+                self.progress_dialog_ref.current = None
+                self._progress_dialog = None
+        except Exception as e:
+            print(f"ダイアログ閉じエラー(ref経由): {e}")
+
+    def _show_cancel_confirm_dialog(self, created_files, output_folder_path):
+        """キャンセル時の確認ダイアログを表示"""
+        file_count = len(created_files)
+        confirm_dialog = None
+
+        def delete_files(e):
+            self._close_dialog(confirm_dialog)
+            deleted_count = 0
+            for filename in created_files:
+                fp = os.path.join(output_folder_path, filename)
+                try:
+                    if os.path.exists(fp):
+                        os.unlink(fp)
+                        deleted_count += 1
+                        print(f"削除: {filename}")
+                except Exception as ex:
+                    print(f"削除失敗: {filename} - {ex}")
+            self._show_message_dialog(
+                "キャンセル完了",
+                f"処理がキャンセルされました。\n{deleted_count}件のファイルを削除しました。")
+
+        def keep_files(e):
+            self._close_dialog(confirm_dialog)
+            self._show_message_dialog(
+                "キャンセル完了",
+                f"処理がキャンセルされました。\n"
+                f"{file_count}件のファイルは保存先に残っています。")
+
+        confirm_dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("キャンセル確認",
+                          size=16, weight=ft.FontWeight.BOLD),
+            content=ft.Container(
+                width=350,
+                content=ft.Column([
+                    ft.Text("処理がキャンセルされました。", size=13),
+                    ft.Container(height=10),
+                    ft.Text(f"既に {file_count} 件のファイルが保存されています。",
+                            size=13),
+                    ft.Container(height=5),
+                    ft.Text("これらのファイルを削除しますか？",
+                            size=13, weight=ft.FontWeight.W_500),
+                ]),
+            ),
+            actions=[
+                ft.ElevatedButton(
+                    "削除する", bgcolor=ft.Colors.RED_600,
+                    color=ft.Colors.WHITE, on_click=delete_files),
+                ft.OutlinedButton("残す", on_click=keep_files),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        self._add_dialog(confirm_dialog)
+
+    async def _progress_monitor_async(self):
+        """進捗を監視してUIを更新する（非同期）"""
+        print("監視タスク開始")
+        loop_count = 0
+        ps = self._processing_state
+
+        while True:
+            self._update_progress_ui()
+            self.page.update()
+            loop_count += 1
+
+            if loop_count % 5 == 0:
+                print(f"監視タスク: ループ{loop_count}回目 - "
+                      f"is_processing={ps['is_processing']}, "
+                      f"completed={ps['completed']}, error={ps['error']}")
+
+            if not ps['is_processing']:
+                print(f"監視タスク: is_processing=False を検知 - "
+                      f"completed={ps['completed']}, error={ps['error']}, "
+                      f"cancelled={ps['cancelled']}")
+                if ps['completed'] or ps['error'] or ps['cancelled']:
+                    print("監視タスク: ループを抜けます")
+                    break
+                else:
+                    print("監視タスク: completedもerrorもcancelledも"
+                          "設定されていないため、待機を継続")
+
+            await asyncio.sleep(0.1)
+
+        print("監視タスク: 処理完了を検知、最終処理開始")
+        self._update_progress_ui()
+        self.page.update()
+        await asyncio.sleep(0.2)
+
+        self._close_progress_dialog()
+        await asyncio.sleep(0.1)
+
+        if ps['cancelled']:
+            print("監視タスク: キャンセル処理")
+            created_files = ps.get('created_files', [])
+            output_folder_path = ps.get('output_folder', '')
+            if created_files and output_folder_path:
+                print(f"作成されたファイル: {len(created_files)}件 "
+                      "- 確認ダイアログを表示")
+                self._show_cancel_confirm_dialog(
+                    created_files, output_folder_path)
+            else:
+                self._show_message_dialog(
+                    "キャンセル", "処理がキャンセルされました。")
+        elif ps['error']:
+            print(f"監視タスク: エラー処理 - {ps['error']}")
+            self._show_message_dialog(
+                "エラー",
+                f"処理中にエラーが発生しました:\n{ps['error']}")
+        elif ps['completed']:
+            print("監視タスク: 完了処理")
+            self._close_all_dialogs()
+            self._show_success_dialog(ps.get('output_folder', ''))
+
+        ps['started'] = False
+        self.app_state['is_dialog_open'] = False
+        print("監視タスク終了")
+
+    def _execute_image_processing(self, save_mode, save_cam, compression,
+                                  selected_cam_list, filename_templates):
+        """画像処理を開始"""
+        ps = self._processing_state
+        img_folder_path = self._current_img_folder
+        output_folder = self._current_output_folder
+
+        if ps.get('started'):
+            print("警告: 処理は既に開始されています。重複実行をスキップします。")
+            return
+        ps['started'] = True
+
+        if filename_templates is None:
+            filename_templates = {
+                'template1': "{comment}_{index}",
+                'template2': "{comment}_{tool}",
+                'template3': "{original}",
+            }
+
+        def check_cancelled():
+            return ps['cancelled']
+
+        def run_processing():
+            print(f"処理スレッド開始: img_folder={img_folder_path}, "
+                  f"output={output_folder}")
+            try:
+                save_task_images_CamNum_selection.process_images(
+                    img_folder_path, output_folder, save_mode, save_cam,
+                    preselected_cam_list=selected_cam_list,
+                    progress_callback=self._update_progress,
+                    filename_templates=filename_templates,
+                    cancel_check=check_cancelled,
+                )
+
+                if ps['cancelled']:
+                    print("処理スレッド: キャンセルされました")
+                    return
+
+                print("画像処理完了")
+
+                if 0 < compression < 100:
+                    print("圧縮処理開始")
+                    convert_bmp_to_jpeg(
+                        output_folder, compression,
+                        progress_callback=self._update_progress,
+                        cancel_check=check_cancelled)
+
+                    if ps['cancelled']:
+                        print("処理スレッド: 圧縮中にキャンセルされました")
+                        return
+
+                    print("圧縮処理完了")
+
+                print("処理スレッド: completed = True を設定")
+                ps['completed'] = True
+
+            except Exception as ex:
+                if ps['cancelled']:
+                    print("処理スレッド: キャンセルによる中断")
+                    return
+
+                print("=" * 50)
+                print("エラーが発生しました:")
+                traceback.print_exc()
+                print("=" * 50)
+
+                ps['error'] = f"{type(ex).__name__}: {ex}"
+
+            finally:
+                if os.path.exists(output_folder):
+                    current_files = set(os.listdir(output_folder))
+                    new_files = current_files - ps.get('existing_files', set())
+                    ps['created_files'] = list(new_files)
+                    print(f"新しく作成されたファイル: {len(new_files)}件")
+
+                print(f"処理スレッド終了: completed={ps['completed']}, "
+                      f"error={ps['error']}, cancelled={ps['cancelled']}")
+                ps['is_processing'] = False
+
+        # 状態を初期化
+        ps.update({
+            'is_processing': True, 'current': 0, 'total': 0,
+            'message': '準備中...', 'completed': False, 'error': None,
+            'cancelled': False, 'created_files': [],
+            'output_folder': output_folder,
+        })
+
+        existing_files = set()
+        if os.path.exists(output_folder):
+            existing_files = set(os.listdir(output_folder))
+        ps['existing_files'] = existing_files
+
+        self._show_progress_dialog()
+
+        threading.Thread(target=run_processing, daemon=True).start()
+        self.page.run_task(self._progress_monitor_async)
+
+    # ==================================================================
+    # メインハンドラ
+    # ==================================================================
+
+    def _on_ok_click(self, e):
         """OKボタンクリック時の処理"""
-        # 重複クリック防止
-        if app_state['is_dialog_open']:
+        if self.app_state['is_dialog_open']:
             print("警告: ダイアログは既に開いています。重複クリックをスキップします。")
             return
-        
-        option = selected_option.current.value
-        img_folder_path = None
-        output_folder = folder_path.current.value if folder_path.current else ""
 
-        # 保存先フォルダのチェック
+        option = self.selected_option.current.value
+        output_folder = (self.folder_path.current.value
+                         if self.folder_path.current else "")
+
         if not output_folder:
-            warning_text.current.value = "画像を保存するフォルダを選択してください"
-            page.update()
+            self.warning_text.current.value = "画像を保存するフォルダを選択してください"
+            self.page.update()
             return
 
         if option == "option1":
-            # Option 1の処理
-            group_num = format_value(group_num_field.current.value if group_num_field.current else "")
-            task_num = format_value(task_num_field.current.value if task_num_field.current else "")
+            group_num = format_value(
+                self.group_num_field.current.value
+                if self.group_num_field.current else "")
+            task_num = format_value(
+                self.task_num_field.current.value
+                if self.task_num_field.current else "")
 
             if group_num == "00" or task_num == "00":
-                warning_text.current.value = "グループ番号とタスク番号を入力してください"
-                page.update()
+                self.warning_text.current.value = (
+                    "グループ番号とタスク番号を入力してください")
+                self.page.update()
                 return
 
-            img_folder_path = f"C:\\viscotech\\task\\g{group_num}\\{task_num}\\img"
+            img_folder_path = (
+                f"C:\\viscotech\\task\\g{group_num}\\{task_num}\\img")
 
             if not os.path.exists(img_folder_path):
-                warning_text.current.value = "imgフォルダが見つかりませんでした。"
-                page.update()
+                self.warning_text.current.value = "imgフォルダが見つかりませんでした。"
+                self.page.update()
                 return
+
+            self.warning_text.current.value = ""
+            self.page.update()
+            self._show_settings_dialog(img_folder_path, output_folder)
 
         elif option == "option2":
-            # Option 2の処理
-            task_file = file_path.current.value if file_path.current else ""
+            task_file = (self.file_path.current.value
+                         if self.file_path.current else "")
             if not task_file:
-                warning_text.current.value = "タスクファイルを選択してください"
-                page.update()
+                self.warning_text.current.value = "タスクファイルを選択してください"
+                self.page.update()
                 return
 
-            # ローディングダイアログを表示してタスクファイルを処理
-            loading_dialog_ref = ft.Ref[ft.AlertDialog]()
-            loading_text_ref = ft.Ref[ft.Text]()
-            loading_result = {'img_folder_path': None, 'error': None}
-            
-            def show_loading_dialog():
-                """ローディングダイアログを表示"""
-                loading_dialog = ft.AlertDialog(
-                    ref=loading_dialog_ref,
-                    modal=True,
-                    title=ft.Text("タスクファイル処理中", size=16, weight=ft.FontWeight.BOLD),
-                    content=ft.Container(
-                        width=300,
-                        content=ft.Column([
-                            ft.Row([
-                                ft.ProgressRing(width=20, height=20, stroke_width=2),
-                                ft.Text(
-                                    ref=loading_text_ref,
-                                    value="準備中...",
-                                    size=13,
-                                ),
-                            ], spacing=10),
-                        ],
-                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                        ),
-                    ),
-                )
-                page.overlay.append(loading_dialog)
-                loading_dialog.open = True
-                page.update()
-            
-            def update_loading_status(message):
-                """ローディング状態を更新"""
-                if loading_text_ref.current:
-                    loading_text_ref.current.value = message
-                    page.update()
-            
-            def close_loading_dialog():
-                """ローディングダイアログを閉じる"""
-                if loading_dialog_ref.current:
-                    loading_dialog_ref.current.open = False
-                    page.update()
-            
-            def process_task_file():
-                """タスクファイルを処理（別スレッド）"""
-                try:
-                    update_loading_status("タスクファイルをコピー中...")
-                    copied_file_path = shutil.copy(task_file, output_folder)
-                    zip_file_path = os.path.splitext(copied_file_path)[0] + ".zip"
-                    os.rename(copied_file_path, zip_file_path)
-
-                    update_loading_status("タスクファイルを展開中...")
-                    with zipfile.ZipFile(zip_file_path, "r") as zip_ref:
-                        zip_ref.extractall(output_folder)
-
-                    os.remove(zip_file_path)
-
-                    update_loading_status("画像フォルダを検索中...")
-                    viscotech_folder_path = os.path.join(output_folder, "viscotech")
-                    
-                    found_img_path = None
-                    for walk_root, dirs, files in os.walk(viscotech_folder_path):
-                        if "img" in dirs:
-                            found_img_path = os.path.join(walk_root, "img")
-                            break
-
-                    if not found_img_path:
-                        loading_result['error'] = "imgフォルダが見つかりませんでした。"
-                    else:
-                        loading_result['img_folder_path'] = found_img_path
-
-                except Exception as ex:
-                    loading_result['error'] = f"処理中にエラーが発生しました: {ex}"
-            
-            async def process_and_continue():
-                """タスクファイル処理後に設定ダイアログを表示"""
-                # 別スレッドで処理を実行
-                process_thread = threading.Thread(target=process_task_file, daemon=True)
-                process_thread.start()
-                
-                # 処理完了を待機
-                while process_thread.is_alive():
-                    await asyncio.sleep(0.1)
-                
-                # ローディングダイアログを閉じる
-                close_loading_dialog()
-                
-                # 結果を確認
-                if loading_result['error']:
-                    warning_text.current.value = loading_result['error']
-                    app_state['is_dialog_open'] = False
-                    page.update()
-                else:
-                    # 設定ダイアログを表示
-                    show_settings_dialog(loading_result['img_folder_path'], output_folder)
-            
-            # ローディングダイアログを表示して処理開始
-            show_loading_dialog()
-            page.run_task(process_and_continue)
-            return  # ここでon_ok_clickを抜ける（処理はprocess_and_continueで継続）
+            self._handle_option2(task_file, output_folder)
 
         elif option == "option3":
-            # Option 3の処理
-            group_num = format_value(group_num_field.current.value if group_num_field.current else "")
-            task_num = format_value(task_num_field.current.value if task_num_field.current else "")
-            option3_folder = option3_folder_field.current.value if option3_folder_field.current else ""
+            group_num = format_value(
+                self.group_num_field.current.value
+                if self.group_num_field.current else "")
+            task_num = format_value(
+                self.task_num_field.current.value
+                if self.task_num_field.current else "")
+            option3_folder = (self.option3_folder_field.current.value
+                              if self.option3_folder_field.current else "")
 
             if group_num == "00" or task_num == "00":
-                warning_text.current.value = "グループ番号とタスク番号を入力してください"
-                page.update()
+                self.warning_text.current.value = (
+                    "グループ番号とタスク番号を入力してください")
+                self.page.update()
                 return
 
             if not option3_folder:
-                warning_text.current.value = "外部のviscotechフォルダを選択してください"
-                page.update()
+                self.warning_text.current.value = (
+                    "外部のviscotechフォルダを選択してください")
+                self.page.update()
                 return
 
-            img_folder_path = os.path.join(option3_folder, f"task\\g{group_num}\\{task_num}\\img")
+            img_folder_path = os.path.join(
+                option3_folder, f"task\\g{group_num}\\{task_num}\\img")
 
             if not os.path.exists(img_folder_path):
-                warning_text.current.value = "imgフォルダが見つかりませんでした。"
-                page.update()
+                self.warning_text.current.value = "imgフォルダが見つかりませんでした。"
+                self.page.update()
                 return
 
-        # 設定ダイアログを表示
-        warning_text.current.value = ""
-        page.update()
-        show_settings_dialog(img_folder_path, output_folder)
+            self.warning_text.current.value = ""
+            self.page.update()
+            self._show_settings_dialog(img_folder_path, output_folder)
 
-    def on_cancel_click(e):
+    def _handle_option2(self, task_file: str, output_folder: str):
+        """Option2: タスクファイルの展開と設定ダイアログ表示"""
+        loading_text_ref = ft.Ref[ft.Text]()
+        loading_result = {'img_folder_path': None, 'error': None}
+
+        def process_task_file():
+            try:
+                loading_result['status'] = "タスクファイルをコピー中..."
+                copied_file_path = shutil.copy(task_file, output_folder)
+                zip_file_path = (
+                    os.path.splitext(copied_file_path)[0] + ".zip")
+                os.rename(copied_file_path, zip_file_path)
+
+                loading_result['status'] = "タスクファイルを展開中..."
+                with zipfile.ZipFile(zip_file_path, "r") as zip_ref:
+                    zip_ref.extractall(output_folder)
+
+                os.remove(zip_file_path)
+
+                loading_result['status'] = "画像フォルダを検索中..."
+                viscotech_folder_path = os.path.join(
+                    output_folder, "viscotech")
+
+                found_img_path = None
+                for walk_root, dirs, files in os.walk(viscotech_folder_path):
+                    if "img" in dirs:
+                        found_img_path = os.path.join(walk_root, "img")
+                        break
+
+                if not found_img_path:
+                    loading_result['error'] = "imgフォルダが見つかりませんでした。"
+                else:
+                    loading_result['img_folder_path'] = found_img_path
+
+            except Exception as ex:
+                loading_result['error'] = (
+                    f"処理中にエラーが発生しました: {ex}")
+
+        async def process_and_continue():
+            process_thread = threading.Thread(
+                target=process_task_file, daemon=True)
+            process_thread.start()
+
+            while process_thread.is_alive():
+                if loading_text_ref.current and loading_result.get('status'):
+                    loading_text_ref.current.value = loading_result['status']
+                self.page.update()
+                await asyncio.sleep(0.1)
+
+            self._close_dialog(loading_dialog)
+
+            if loading_result['error']:
+                self.warning_text.current.value = loading_result['error']
+                self.app_state['is_dialog_open'] = False
+                self.page.update()
+            else:
+                self._show_settings_dialog(
+                    loading_result['img_folder_path'], output_folder)
+
+        loading_dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("タスクファイル処理中",
+                          size=16, weight=ft.FontWeight.BOLD),
+            content=ft.Container(
+                width=300,
+                content=ft.Column([
+                    ft.Row([
+                        ft.ProgressRing(width=20, height=20, stroke_width=2),
+                        ft.Text(ref=loading_text_ref,
+                                value="準備中...", size=13),
+                    ], spacing=10),
+                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+            ),
+        )
+        self._add_dialog(loading_dialog)
+        self.page.run_task(process_and_continue)
+
+    async def _on_cancel_click(self, e):
         """終了ボタンクリック時の処理"""
-        import sys
-        sys.exit(0)
+        self.page.window.visible = False
+        self.page.update()
+        await asyncio.sleep(0.2)
+        os._exit(0)
 
-    # サイドバー（情報パネル）
-    sidebar = ft.Container(
-        width=220,
-        bgcolor=ft.Colors.GREY_100,
-        padding=15,
-        alignment=ft.Alignment(-1, -1),  # top_left
-        content=ft.Column([
-            ft.Text(
-                "情報パネル",
-                size=14,
-                weight=ft.FontWeight.BOLD,
-            ),
-            ft.Divider(),
-            ft.Text(
-                ref=info_text,
-                value=option_descriptions["option1"],
-                size=11,
-            ),
-        ],
-        scroll=ft.ScrollMode.AUTO,
-        alignment=ft.MainAxisAlignment.START,
-        ),
-    )
+    # ==================================================================
+    # UI 構築
+    # ==================================================================
 
-    # メインコンテンツ
-    main_content = ft.Container(
-        expand=True,
-        padding=ft.padding.only(left=20, right=20, top=15, bottom=15),
-        alignment=ft.Alignment(-1, -1),  # top_left
-        content=ft.Column([
-            # タイトル
-            ft.Text(
-                "タスク画像保存フロー",
-                size=20,
-                weight=ft.FontWeight.BOLD,
+    def _build_sidebar(self):
+        return ft.Container(
+            width=220,
+            bgcolor=ft.Colors.GREY_100,
+            padding=15,
+            alignment=ft.Alignment(-1, -1),
+            content=ft.Column([
+                ft.Text("情報パネル", size=14, weight=ft.FontWeight.BOLD),
+                ft.Divider(),
+                ft.Text(
+                    ref=self.info_text,
+                    value=OPTION_DESCRIPTIONS["option1"],
+                    size=11,
+                ),
+            ],
+            scroll=ft.ScrollMode.AUTO,
+            alignment=ft.MainAxisAlignment.START,
             ),
-            ft.Container(
-                height=2,
-                bgcolor=ft.Colors.BLUE,
-                border_radius=2,
-            ),
-            ft.Container(height=10),
+        )
 
-            # インポート先選択
-            ft.Text("インポート先を選択", size=14, weight=ft.FontWeight.W_500),
-            ft.Container(
-                bgcolor=ft.Colors.GREY_50,
-                padding=10,
-                border_radius=8,
-                content=ft.RadioGroup(
-                    ref=selected_option,
-                    value="option1",
-                    on_change=update_dynamic_content,
-                    content=ft.Column([
-                        ft.Radio(value="option1", label="VTV9000上のタスクから (オフラインPC)"),
-                        ft.Radio(value="option2", label="タスクファイルから (ziq, zit, zii)"),
-                        ft.Radio(value="option3", label="VTV9000上のタスクから (共有VTV)"),
-                    ],
-                    spacing=2,
+    def _build_main_content(self):
+        return ft.Container(
+            expand=True,
+            padding=ft.padding.only(left=20, right=20, top=15, bottom=15),
+            alignment=ft.Alignment(-1, -1),
+            content=ft.Column([
+                ft.Text("タスク画像保存フロー",
+                        size=20, weight=ft.FontWeight.BOLD),
+                ft.Container(
+                    height=2, bgcolor=ft.Colors.BLUE, border_radius=2),
+                ft.Container(height=10),
+
+                ft.Text("インポート先を選択",
+                        size=14, weight=ft.FontWeight.W_500),
+                ft.Container(
+                    bgcolor=ft.Colors.GREY_50, padding=10, border_radius=8,
+                    content=ft.RadioGroup(
+                        ref=self.selected_option, value="option1",
+                        on_change=self._update_dynamic_content,
+                        content=ft.Column([
+                            ft.Radio(value="option1",
+                                     label="VTV9000上のタスクから (オフラインPC)"),
+                            ft.Radio(value="option2",
+                                     label="タスクファイルから (ziq, zit, zii)"),
+                            ft.Radio(value="option3",
+                                     label="VTV9000上のタスクから (共有VTV)"),
+                        ], spacing=2),
                     ),
                 ),
+                ft.Container(height=8),
+
+                ft.Text("画像を保存するフォルダを選択",
+                        size=14, weight=ft.FontWeight.W_500),
+                ft.Row([
+                    ft.TextField(
+                        ref=self.folder_path, expand=True,
+                        hint_text="フォルダを選択...",
+                        border_radius=8, text_size=13,
+                        content_padding=ft.padding.only(
+                            left=10, right=10, top=8, bottom=8),
+                    ),
+                    ft.ElevatedButton(
+                        "参照", icon=ft.Icons.FOLDER_OPEN,
+                        on_click=self._pick_folder),
+                ]),
+
+                ft.Text(ref=self.warning_text, value="",
+                        color=ft.Colors.RED, size=11),
+                ft.Container(height=5),
+
+                ft.Container(
+                    content=ft.Column(
+                        ref=self.dynamic_content, spacing=8,
+                        alignment=ft.MainAxisAlignment.START),
+                ),
+                ft.Container(height=10),
+
+                ft.Row([
+                    ft.ElevatedButton(
+                        "OK", width=130, height=40,
+                        bgcolor=ft.Colors.BLUE, color=ft.Colors.WHITE,
+                        on_click=self._on_ok_click),
+                    ft.OutlinedButton(
+                        "終了", width=130, height=40,
+                        on_click=self._on_cancel_click),
+                ]),
+            ],
+            spacing=5,
+            scroll=ft.ScrollMode.AUTO,
+            alignment=ft.MainAxisAlignment.START,
             ),
-            ft.Container(height=8),
-
-            # 保存先フォルダ選択
-            ft.Text("画像を保存するフォルダを選択", size=14, weight=ft.FontWeight.W_500),
-            ft.Row([
-                ft.TextField(
-                    ref=folder_path,
-                    expand=True,
-                    hint_text="フォルダを選択...",
-                    border_radius=8,
-                    content_padding=ft.padding.only(left=10, right=10, top=8, bottom=8),
-                    text_size=13,
-                ),
-                ft.ElevatedButton(
-                    "参照",
-                    icon=ft.Icons.FOLDER_OPEN,
-                    on_click=pick_folder,
-                ),
-            ]),
-
-            # 警告テキスト
-            ft.Text(
-                ref=warning_text,
-                value="",
-                color=ft.Colors.RED,
-                size=11,
-            ),
-            ft.Container(height=5),
-
-            # 動的コンテンツ（最小高さを設定して位置を安定させる）
-            ft.Container(
-                height=200,  # Option 3のコンテンツがすべて収まる高さ
-                content=ft.Column(
-                    ref=dynamic_content,
-                    spacing=8,
-                    alignment=ft.MainAxisAlignment.START,
-                ),
-            ),
-            ft.Container(height=10),
-
-            # ボタン
-            ft.Row([
-                ft.ElevatedButton(
-                    "OK",
-                    width=130,
-                    height=40,
-                    bgcolor=ft.Colors.BLUE,
-                    color=ft.Colors.WHITE,
-                    on_click=on_ok_click,
-                ),
-                ft.OutlinedButton(
-                    "終了",
-                    width=130,
-                    height=40,
-                    on_click=on_cancel_click,
-                ),
-            ]),
-        ],
-        spacing=5,
-        scroll=ft.ScrollMode.AUTO,
-        alignment=ft.MainAxisAlignment.START,
-        ),
-    )
-
-    # レイアウト
-    page.add(
-        ft.Row([
-            sidebar,
-            ft.VerticalDivider(width=1),
-            main_content,
-        ],
-        expand=True,
-        vertical_alignment=ft.CrossAxisAlignment.START,
         )
-    )
 
-    # 初期コンテンツを設定
-    update_dynamic_content()
+    def _build_ui(self):
+        self.page.add(
+            ft.Row([
+                self._build_sidebar(),
+                ft.VerticalDivider(width=1),
+                self._build_main_content(),
+            ],
+            expand=True,
+            vertical_alignment=ft.CrossAxisAlignment.START,
+            )
+        )
+
+
+def main(page: ft.Page):
+    TaskImageSaverApp(page)
 
 
 if __name__ == "__main__":
-    ft.app(target=main)  # Flet 0.80以降はft.app()内部でrun()が呼ばれる
+    ft.app(target=main)

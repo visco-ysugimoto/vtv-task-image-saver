@@ -7,29 +7,26 @@ import re
 def sanitize_filename(filename):
     """
     Windowsで使用できない文字をファイル名から除去・置換する関数
-    
+
     Args:
         filename: サニタイズするファイル名
-    
+
     Returns:
         無効な文字を除去したファイル名
     """
-    # Windowsで使用できない文字: \ / : * ? " < > |
     invalid_chars = r'[\\/:*?"<>|]'
-    # 無効な文字をアンダースコアに置換
     sanitized = re.sub(invalid_chars, '_', str(filename))
-    # 先頭・末尾の空白とドットを除去（Windowsの制限）
     sanitized = sanitized.strip(' .')
-    # 空文字列になった場合はデフォルト名を返す
     if not sanitized:
         sanitized = 'unnamed'
     return sanitized
 
 
-def apply_filename_template(template, comment, tool_comment, original_name, cam, div, index, file_source=None):
+def apply_filename_template(template, comment, tool_comment, original_name,
+                            cam, div, index, file_source=None):
     """
     テンプレートにプレースホルダーを適用してファイル名を生成する関数
-    
+
     Args:
         template: ファイル名テンプレート（例: "{comment}_{index}"）
         comment: 画像コメント
@@ -39,7 +36,7 @@ def apply_filename_template(template, comment, tool_comment, original_name, cam,
         div: DIV番号（列番号）
         index: 連番
         file_source: 参照元テキストファイル名（拡張子なし）
-    
+
     Returns:
         プレースホルダーを置換したファイル名（サニタイズ済み）
     """
@@ -53,7 +50,6 @@ def apply_filename_template(template, comment, tool_comment, original_name, cam,
         "file": "" if file_source is None else str(file_source),
     }
 
-    # {name} / {name:03} の簡易フォーマット指定に対応
     pattern = re.compile(r"\{([a-zA-Z0-9_]+)(?::([^{}]+))?\}")
 
     def _replace(match):
@@ -61,17 +57,14 @@ def apply_filename_template(template, comment, tool_comment, original_name, cam,
         fmt = match.group(2)
 
         if name not in values:
-            # 未対応プレースホルダーは空文字にする（プレビュー/本処理の両方で安全に）
             return ""
 
         raw = values.get(name, "")
         if fmt:
-            # 数値ゼロ埋め目的を想定し、まずint変換を試す
             try:
                 as_int = int(raw) if str(raw).strip() != "" else 0
                 return format(as_int, fmt)
             except Exception:
-                # 文字列などはフォーマットに失敗する可能性があるためフォールバック
                 try:
                     return format(raw, fmt)
                 except Exception:
@@ -83,63 +76,196 @@ def apply_filename_template(template, comment, tool_comment, original_name, cam,
     return sanitize_filename(result)
 
 
-def get_camera_list(folder_path):
-    """
-    imgフォルダからカメラリスト(調整済み)を取得する関数
-    
-    Args:
-        folder_path: imgフォルダのパス
-    
-    Returns:
-        カメラリストの2次元配列 例: [[1, 1], [1, 2], [2, 1], [2, 2]]
-    """
-    def get_file_list(folder_path, extension='.txt'):
-        return [filename for filename in os.listdir(folder_path) if filename.endswith(extension)]
+# ---------------------------------------------------------------------------
+# 共通ヘルパー関数（旧 get_camera_list / process_images 内の重複を排除）
+# ---------------------------------------------------------------------------
 
-    def find_cam_and_div(filename):
-        numbers = re.findall(r'\d+', filename)
-        return [int(num) for num in numbers[:2]]
+def get_file_list(folder_path, extension='.txt'):
+    """指定フォルダから指定拡張子のファイルリストを取得"""
+    return [f for f in os.listdir(folder_path) if f.endswith(extension)]
 
-    def adjust_save_CAM_list(save_CAM_list):
-        if not save_CAM_list:
-            return save_CAM_list
-        adjusted_list = [save_CAM_list[0]]
-        for i in range(1, len(save_CAM_list)):
-            current_X, current_Y = save_CAM_list[i]
-            previous_X, previous_Y = adjusted_list[-1]
-            if current_X == previous_X:
-                if current_Y != previous_Y + 1:
-                    current_Y = previous_Y + 1
-            adjusted_list.append([current_X, current_Y])
-        return adjusted_list
 
-    def process_first_file(file_path):
-        save_CAM_list = []
-        with open(file_path, 'r', encoding='utf-8') as file:
-            for line in file:
-                if '.DIV' in line:
-                    save_CAM_list.append(find_cam_and_div(line))
+def find_cam_and_div(filename):
+    """ファイル名からカメラ番号とDIV番号を抽出"""
+    numbers = re.findall(r'\d+', filename)
+    return [int(num) for num in numbers[:2]]
+
+
+def adjust_save_CAM_list(save_CAM_list):
+    """カラー画像のDIV番号を連番に修正"""
+    if not save_CAM_list:
         return save_CAM_list
+    adjusted_list = [save_CAM_list[0]]
+    for i in range(1, len(save_CAM_list)):
+        current_X, current_Y = save_CAM_list[i]
+        previous_X, previous_Y = adjusted_list[-1]
+        if current_X == previous_X:
+            if current_Y != previous_Y + 1:
+                current_Y = previous_Y + 1
+        adjusted_list.append([current_X, current_Y])
+    return adjusted_list
 
+
+def process_first_file(file_path):
+    """最初のテキストファイルを処理してカメラ・DIVリストを取得"""
+    save_CAM_list = []
+    with open(file_path, 'r', encoding='utf-8') as file:
+        for line in file:
+            if '.DIV' in line:
+                save_CAM_list.append(find_cam_and_div(line))
+    return save_CAM_list
+
+
+def is_image_capture_format(text):
+    """「画像取込XX」形式（画像取込+2桁のみ）に完全一致するか判定"""
+    if not isinstance(text, str):
+        return False
+    return re.fullmatch(r"画像取込\d{2}", text) is not None
+
+
+def should_save_file(save_mode, img_info_dict):
+    """画像ファイルを保存するかどうかを判定"""
+    if save_mode == '0':
+        return True
+    if (save_mode == '1'
+            and img_info_dict.get('comment')
+            and img_info_dict['comment'] != 'この画像は自動で保存されました。'):
+        return True
+    if save_mode == '2' and img_info_dict.get('lockMode') == '1':
+        return True
+    return False
+
+
+def create_mapping(original_list, converted_list):
+    """2つのリスト間の双方向マッピングを作成"""
+    mapping_AB = {}
+    mapping_BA = {}
+    for original, converted in zip(original_list, converted_list):
+        mapping_AB[tuple(converted)] = tuple(original)
+        mapping_BA[tuple(original)] = tuple(converted)
+    return mapping_AB, mapping_BA
+
+
+def get_original_from_converted(converted_element, mapping_AB):
+    """変換後の要素から変換前の要素を取得"""
+    return mapping_AB.get(tuple(converted_element), None)
+
+
+def get_converted_from_original(original_element, mapping_BA):
+    """変換前の要素から変換後の要素を取得"""
+    return mapping_BA.get(tuple(original_element), None)
+
+
+def is_element_in_2d_array(target, array_2d):
+    """2D配列内に特定の要素が含まれるかチェック"""
+    return any(target == element for element in array_2d)
+
+
+def generate_new_file_name(img_info_dict, file_name, index, tool_comment,
+                           cam, div, filename_templates,
+                           is_duplicate_comment=False):
+    """テンプレートを使用してファイル名を生成"""
+    comment = img_info_dict.get('comment', '')
+    original_name = file_name.replace(".bmp", '')
+    file_source = img_info_dict.get('fileName', '')
+
+    if comment:
+        if is_image_capture_format(tool_comment):
+            template = filename_templates.get('template1', "{comment}_{index}")
+        else:
+            template = filename_templates.get('template2', "{comment}_{tool}")
+    else:
+        template = filename_templates.get('template3', "{original}")
+
+    if is_duplicate_comment and comment:
+        template = template + "_{file}"
+
+    return apply_filename_template(
+        template=template,
+        comment=comment,
+        tool_comment=tool_comment,
+        original_name=original_name,
+        cam=cam,
+        div=div,
+        index=index,
+        file_source=file_source,
+    )
+
+
+def copy_image_files(img_info_dict, output_folder, folder_path,
+                     cam_tool_comment_list, filename_templates,
+                     is_duplicate_comment=False,
+                     camera_filter=None, mapping_BA=None):
+    """
+    画像ファイルをコピーする統合関数。
+
+    camera_filter が None の場合は全ファイルをコピー。
+    camera_filter が指定されている場合は該当カメラのファイルのみコピー。
+    """
+    used_in_session = set()
+    base_name_counts = {}
+
+    for i, (file_name, log_idx) in enumerate(img_info_dict['fileNameList'], 1):
+        cam_div = find_cam_and_div(file_name)
+        cam = cam_div[0] if len(cam_div) > 0 else ''
+        div = cam_div[1] if len(cam_div) > 1 else ''
+        tool_comment = (cam_tool_comment_list[log_idx]
+                        if log_idx < len(cam_tool_comment_list) else None)
+
+        if camera_filter is not None and mapping_BA is not None:
+            converted = get_converted_from_original(cam_div, mapping_BA)
+            if converted is None or not is_element_in_2d_array(list(converted), camera_filter):
+                continue
+
+        new_file_name = generate_new_file_name(
+            img_info_dict, file_name, i, tool_comment, cam, div,
+            filename_templates, is_duplicate_comment,
+        )
+        base_name = new_file_name
+        new_filename = f"{new_file_name}.bmp"
+
+        while (new_filename in used_in_session
+               or os.path.exists(os.path.join(output_folder, new_filename))):
+            count = base_name_counts.get(base_name, 2)
+            while (f"{base_name}_{count}.bmp" in used_in_session
+                   or os.path.exists(os.path.join(output_folder,
+                                                  f"{base_name}_{count}.bmp"))):
+                count += 1
+            new_file_name = f"{base_name}_{count}"
+            new_filename = f"{new_file_name}.bmp"
+            base_name_counts[base_name] = count + 1
+
+        base_name_counts[base_name] = 2
+        used_in_session.add(new_filename)
+        shutil.copy(
+            os.path.join(folder_path, file_name),
+            os.path.join(output_folder, new_filename),
+        )
+
+
+# ---------------------------------------------------------------------------
+# メイン公開関数
+# ---------------------------------------------------------------------------
+
+def get_camera_list(folder_path):
+    """imgフォルダからカメラリスト(調整済み)を取得する関数"""
     file_list = get_file_list(folder_path)
     if not file_list:
         return []
-    
     first_file = file_list[0]
     file_path = os.path.join(folder_path, first_file)
     save_CAM_list = process_first_file(file_path)
-    adjust_CAM_list = adjust_save_CAM_list(save_CAM_list)
-    
-    return adjust_CAM_list
+    return adjust_save_CAM_list(save_CAM_list)
 
 
-# 画像取込ツールのコメントを取得する関数:cammaster_seq.logから情報を抽出
 def parse_cammaster_log(log_file_path):
+    """cammaster_seq.logからカメラ情報を辞書形式で取得"""
     cam_info_dict = {}
     with open(log_file_path, 'r', encoding='utf-8') as file:
         print("read cammaster_seq.log")
         for line in file:
-            match = re.search(r'\((\d+),\s*(\d+):\d+\)\s*:\s*画像取込,\s*name\s*=\s*(\w+)', line)
+            match = re.search(
+                r'\((\d+),\s*(\d+):\d+\)\s*:\s*画像取込,\s*name\s*=\s*(\w+)', line)
             if match:
                 x = int(match.group(1))
                 y = int(match.group(2))
@@ -149,28 +275,26 @@ def parse_cammaster_log(log_file_path):
 
 
 def parse_cammaster_log_ordered(log_file_path):
-    """
-    cammaster_seq.logを読み込み、出現順にツール名のリストを返す。
-    1つの画像取込で複数回撮像している場合、各撮像に対応するエントリが順に並ぶ。
-    
-    Returns:
-        list[str]: ツール名のリスト（ログの出現順）
-    """
+    """cammaster_seq.logを読み込み、出現順にツール名のリストを返す"""
     result = []
     if not os.path.exists(log_file_path):
         return result
     with open(log_file_path, 'r', encoding='utf-8') as file:
         for line in file:
-            match = re.search(r'\((\d+),\s*(\d+):\d+\)\s*:\s*画像取込,\s*name\s*=\s*(\w+)', line)
+            match = re.search(
+                r'\((\d+),\s*(\d+):\d+\)\s*:\s*画像取込,\s*name\s*=\s*(\w+)', line)
             if match:
                 result.append(match.group(3))
     return result
 
-# 画像を処理するためのメイン関数
-def process_images(folder_path, output_folder, save_mode, save_cam, output_file_path=None, preselected_cam_list=None, progress_callback=None, filename_templates=None, cancel_check=None):
+
+def process_images(folder_path, output_folder, save_mode, save_cam,
+                   output_file_path=None, preselected_cam_list=None,
+                   progress_callback=None, filename_templates=None,
+                   cancel_check=None):
     """
     画像を処理してコピーするメイン関数
-    
+
     Args:
         progress_callback: 進捗を報告するコールバック関数 (current, total, message) -> None
         filename_templates: ファイル名テンプレートの辞書
@@ -179,291 +303,106 @@ def process_images(folder_path, output_folder, save_mode, save_cam, output_file_
             - template3: コメントなし
         cancel_check: キャンセル状態をチェックするコールバック関数 () -> bool
     """
-    # デフォルトのテンプレートを設定
     if filename_templates is None:
         filename_templates = {
             'template1': "{comment}_{index}",
             'template2': "{comment}_{tool}",
             'template3': "{original}",
         }
-    # 追加: cammaster_seq.logの情報を取得（出現順＝撮像順に対応）
+
     log_file_path = os.path.join(os.path.dirname(folder_path), 'cammaster_seq.log')
     cam_tool_comment_list = parse_cammaster_log_ordered(log_file_path)
-    file_index = [0]  # ログの何番目に対応するか（テキストファイルごとにリセット）
-    seen_comments = {}  # コメント -> 最初に出現したテキストファイル名
-    
-    # 指定された拡張子（デフォルトは.txt）のファイルリストを取得
-    def get_file_list(folder_path, extension='.txt'):
-        return [filename for filename in os.listdir(folder_path) if filename.endswith(extension)]
+    file_index = [0]
+    seen_comments = {}
 
-    # ファイル名からカメラ番号とDIV番号を抽出
-    def find_cam_and_div(filename):
-        numbers = re.findall(r'\d+', filename)
-        return [int(num) for num in numbers[:2]]
-    
-    # カラー画像の時にDIVを修正するため使用
-    def adjust_save_CAM_list(save_CAM_list):
-    # リストが空でないことを確認
-        if not save_CAM_list:
-            return save_CAM_list
-
-        # 1つ目の要素からスタート
-        adjusted_list = [save_CAM_list[0]]
-
-        for i in range(1, len(save_CAM_list)):
-            current_X, current_Y = save_CAM_list[i]
-            previous_X, previous_Y = adjusted_list[-1]  # 調整後のリストの最後の要素
-
-            if current_X == previous_X:  # X_i = X_(i+1) の場合
-                if current_Y != previous_Y + 1:  # Y_(i+1) と Y_i の差が1でない場合
-                    current_Y = previous_Y + 1  # Y_(i+1) を Y_i + 1 に調整
-            # 調整後の値をリストに追加
-            adjusted_list.append([current_X, current_Y])
-        return adjusted_list
-    
-    # 最初のファイルを処理して保存すべきカメラ番号をリストアップ
-    def process_first_file(file_path):
-        save_CAM_list = []
-        with open(file_path, 'r', encoding='utf-8') as file:
-            for line in file:
-                if '.DIV' in line:  # DIVが含まれる行を処理
-                    save_CAM_list.append(find_cam_and_div(line))
-        return save_CAM_list
-
-    # 各ファイルの内容を処理して画像情報を収集
     def process_file(file_path, img_info_dict, file_name_list):
+        """各テキストファイルの内容を処理して画像情報を収集"""
         with open(file_path, 'r', encoding='utf-8') as file:
             for line in file:
-                if 'Comment=' in line:  # コメント行を抽出
+                if 'Comment=' in line:
                     img_info_dict['comment'] = line.replace('Comment=', '').strip()
-                if 'Locked=' in line:  # ロック状態を抽出
+                if 'Locked=' in line:
                     img_info_dict['lockMode'] = line.replace('Locked=', '').strip()
-                if 'FILE=' in line:  # 画像ファイル名を抽出
+                if 'FILE=' in line:
                     file_name = line.replace('FILE=', '').strip()
                     idx = file_index[0]
                     file_index[0] += 1
-                    if should_save_file(img_info_dict, file_name):  # 保存条件を満たすか確認
+                    if should_save_file(save_mode, img_info_dict):
                         file_name_list.append((file_name, idx))
 
-    # 画像ファイルを保存するかどうかを判定
-    def should_save_file(img_info_dict, file_name):
-        if save_mode == '0':  # 全てのファイルを保存
-            return True
-        if save_mode == '1' and img_info_dict.get('comment') and img_info_dict['comment'] != 'この画像は自動で保存されました。':
-            return True  # コメントがあり、指定のコメントでない場合に保存
-        if save_mode == '2' and img_info_dict.get('lockMode') == '1':
-            return True  # ロックされている画像のみ保存
-        return False
-
-    def is_image_capture_format(text):
-        """
-        入力された文字列が「画像取込XY」の形式（画像取込+2桁のみ）に完全一致するかどうかを判定します。
-        「画像取込01_はんだ」などは該当せず、template2で{comment}_{tool}を使用し、重複時は連番を付与します。
-        """
-        if not isinstance(text, str):
-            return False
-        return re.fullmatch(r"画像取込\d{2}", text) is not None
-
-    # ファイルを指定フォルダにコピー
-    def copy_files(img_info_dict, output_folder, folder_path, is_duplicate_comment=False):
-        used_in_session = set()
-        base_name_counts = {}
-        for i, (file_name, log_idx) in enumerate(img_info_dict['fileNameList'], 1):
-            # カメラ番号とDIV番号を取得
-            cam_div = find_cam_and_div(file_name)
-            cam = cam_div[0] if len(cam_div) > 0 else ''
-            div = cam_div[1] if len(cam_div) > 1 else ''
-            # ログのlog_idx番目（出現順）のツール名を使用
-            tool_comment = cam_tool_comment_list[log_idx] if log_idx < len(cam_tool_comment_list) else None
-            
-            # テンプレートを使用してファイル名を生成
-            new_file_name = generate_new_file_name(img_info_dict, file_name, i, tool_comment, cam, div, is_duplicate_comment)
-            base_name = new_file_name
-            new_filename = f"{new_file_name}.bmp"
-            # 重複時は連番を付与（拡張_画像取込01_はんだ → 拡張_画像取込01_はんだ_2, _3, ...）
-            while new_filename in used_in_session or os.path.exists(os.path.join(output_folder, new_filename)):
-                count = base_name_counts.get(base_name, 2)
-                while f"{base_name}_{count}.bmp" in used_in_session or os.path.exists(os.path.join(output_folder, f"{base_name}_{count}.bmp")):
-                    count += 1
-                new_file_name = f"{base_name}_{count}"
-                new_filename = f"{new_file_name}.bmp"
-                base_name_counts[base_name] = count + 1
-            base_name_counts[base_name] = 2
-            used_in_session.add(new_filename)
-            shutil.copy(os.path.join(folder_path, file_name), os.path.join(output_folder, new_filename))
-
-    # 特定のカメラ番号のファイルを選んでコピー
-    def copy_select_files(img_info_dict, output_folder, folder_path, adjust_CAM_list, mapping_BA, save_CAM_list, is_duplicate_comment=False):
-        used_in_session = set()
-        base_name_counts = {}
-        for i, (file_name, log_idx) in enumerate(img_info_dict['fileNameList'], 1):
-            # カメラ番号とDIV番号を取得
-            cam_div = find_cam_and_div(file_name)
-            cam = cam_div[0] if len(cam_div) > 0 else ''
-            div = cam_div[1] if len(cam_div) > 1 else ''
-            # ログのlog_idx番目（出現順）のツール名を使用
-            tool_comment = cam_tool_comment_list[log_idx] if log_idx < len(cam_tool_comment_list) else None
-            
-            if is_element_in_2d_array(list(get_converted_from_original(cam_div, mapping_BA)), save_CAM_list):  # 指定されたカメラ番号に一致するか確認
-                # テンプレートを使用してファイル名を生成
-                new_file_name = generate_new_file_name(img_info_dict, file_name, i, tool_comment, cam, div, is_duplicate_comment)
-                base_name = new_file_name
-                new_filename = f"{new_file_name}.bmp"
-                # 重複時は連番を付与（拡張_画像取込01_はんだ → 拡張_画像取込01_はんだ_2, _3, ...）
-                while new_filename in used_in_session or os.path.exists(os.path.join(output_folder, new_filename)):
-                    count = base_name_counts.get(base_name, 2)
-                    while f"{base_name}_{count}.bmp" in used_in_session or os.path.exists(os.path.join(output_folder, f"{base_name}_{count}.bmp")):
-                        count += 1
-                    new_file_name = f"{base_name}_{count}"
-                    new_filename = f"{new_file_name}.bmp"
-                    base_name_counts[base_name] = count + 1
-                base_name_counts[base_name] = 2
-                used_in_session.add(new_filename)
-                shutil.copy(os.path.join(folder_path, file_name), os.path.join(output_folder, new_filename))
-
-    # 新しいファイル名を生成（テンプレート対応）
-    def generate_new_file_name(img_info_dict, file_name, index, tool_comment, cam, div, is_duplicate_comment=False):
-        """
-        テンプレートを使用してファイル名を生成
-        
-        Args:
-            img_info_dict: 画像情報の辞書（comment, fileName, fileNameListなど）
-            file_name: 元のファイル名
-            index: 連番
-            tool_comment: ツールコメント
-            cam: カメラ番号
-            div: DIV番号
-            is_duplicate_comment: 同じコメントが別テキストファイルから2回目以降の出現か
-        """
-        comment = img_info_dict.get('comment', '')
-        original_name = file_name.replace(".bmp", '')
-        file_source = img_info_dict.get('fileName', '')
-        
-        # 条件に応じてテンプレートを選択
-        if comment:
-            if is_image_capture_format(tool_comment):
-                # 条件1: コメントあり + 画像取込XX形式
-                template = filename_templates.get('template1', "{comment}_{index}")
-            else:
-                # 条件2: コメントあり + その他のツールコメント
-                template = filename_templates.get('template2', "{comment}_{tool}")
-        else:
-            # 条件3: コメントなし
-            template = filename_templates.get('template3', "{original}")
-        
-        # 同じコメントが別テキストファイルから2回目以降の場合、末尾に{file}を追加
-        if is_duplicate_comment and comment:
-            template = template + "_{file}"
-        
-        # テンプレートを適用
-        return apply_filename_template(
-            template=template,
-            comment=comment,
-            tool_comment=tool_comment,
-            original_name=original_name,
-            cam=cam,
-            div=div,
-            index=index,
-            file_source=file_source,
-        )
-
-    def create_mapping(original_list, converted_list):
-        # converted_listの各要素に対応するoriginal_listの要素を記憶する辞書を作成
-        mapping_AB = {}  # converted_list -> original_list のマッピング
-        mapping_BA = {}  # original_list -> converted_list のマッピング
-        
-        for original, converted in zip(original_list, converted_list):
-            mapping_AB[tuple(converted)] = tuple(original)
-            mapping_BA[tuple(original)] = tuple(converted)
-            
-        return mapping_AB, mapping_BA
-
-    def get_original_from_converted(converted_element, mapping_AB):
-        # converted_listの要素からoriginal_listの要素を取得する
-        return mapping_AB.get(tuple(converted_element), None)
-
-    def get_converted_from_original(original_element, mapping_BA):
-        # original_listの要素からconverted_listの要素を取得する
-        return mapping_BA.get(tuple(original_element), None)
-    
-    # 2D配列内に特定の要素が含まれるかチェック
-    def is_element_in_2d_array(target, array_2d):
-        return any(target == element for element in array_2d)
-
-    # ファイルリストを取得
     file_list = get_file_list(folder_path)
     first_file = file_list[0] if file_list else None
     save_CAM_list = []
-    
+    mapping_BA = {}
+
     total_files = len(file_list)
     processed_count = 0
 
-    # 各ファイルを処理
     for filename in file_list:
-        # キャンセルチェック
         if cancel_check and cancel_check():
             print("画像処理がキャンセルされました")
             if progress_callback:
                 progress_callback(processed_count, total_files, "キャンセルされました")
             return
-        
-        # 進捗を報告
+
         if progress_callback:
             progress_callback(processed_count, total_files, f"処理中: {filename}")
+
         file_path = os.path.join(folder_path, filename)
         img_info_dict = {'fileName': filename.replace('.txt', '')}
         file_name_list = []
-        file_index[0] = 0  # テキストファイルごとにリセット（各ファイルは同一のツール実行順序に対応）
-        
-        # 最初のファイルについて、ツールコメントを取得
+        file_index[0] = 0
+
         if filename == first_file:
-            save_CAM_list = process_first_file(file_path)
+            raw_cam_list = process_first_file(file_path)
             print("save_CAM_list=")
-            print(save_CAM_list)
-            adjust_CAM_list = adjust_save_CAM_list(save_CAM_list)
+            print(raw_cam_list)
+            adjust_CAM_list = adjust_save_CAM_list(raw_cam_list)
             print("adjust_CAM_list=")
             print(adjust_CAM_list)
-            # 対応関係を作成
-            mapping_AB, mapping_BA = create_mapping(save_CAM_list, adjust_CAM_list)
-            print(f"変換要素：{list(get_original_from_converted([1,1],mapping_AB))}")
-        
-        if filename == first_file and save_cam == '1':  # 最初のファイルを処理し、カメラ番号を選択
+            mapping_AB, mapping_BA = create_mapping(raw_cam_list, adjust_CAM_list)
+            print(f"変換要素：{list(get_original_from_converted([1, 1], mapping_AB))}")
+
+        if filename == first_file and save_cam == '1':
             if preselected_cam_list is not None:
-                # 事前に選択されたカメラリストを使用（Fletから呼ばれた場合）
                 save_CAM_list = preselected_cam_list
             else:
-                # カメラリストが渡されていない場合は全てのカメラを選択
                 save_CAM_list = adjust_CAM_list
 
         process_file(file_path, img_info_dict, file_name_list)
         img_info_dict['fileNameList'] = file_name_list
 
-        # 同じコメントが別テキストファイルから出現したかを判定
         comment = img_info_dict.get('comment', '')
         current_source = img_info_dict.get('fileName', '')
         is_duplicate_comment = False
         if comment:
             if comment in seen_comments and seen_comments[comment] != current_source:
                 is_duplicate_comment = True
-                print(f"重複コメント検出: '{comment}' (初出: {seen_comments[comment]}, 今回: {current_source})")
+                print(f"重複コメント検出: '{comment}' "
+                      f"(初出: {seen_comments[comment]}, 今回: {current_source})")
             elif comment not in seen_comments:
                 seen_comments[comment] = current_source
 
         if save_cam == '0':
-            copy_files(img_info_dict, output_folder, folder_path, is_duplicate_comment)
+            copy_image_files(
+                img_info_dict, output_folder, folder_path,
+                cam_tool_comment_list, filename_templates, is_duplicate_comment,
+            )
         elif save_cam == '1':
-            copy_select_files(img_info_dict, output_folder, folder_path, adjust_CAM_list, mapping_BA, save_CAM_list, is_duplicate_comment)
-        
-        # 進捗を更新
+            copy_image_files(
+                img_info_dict, output_folder, folder_path,
+                cam_tool_comment_list, filename_templates, is_duplicate_comment,
+                camera_filter=save_CAM_list, mapping_BA=mapping_BA,
+            )
+
         processed_count += 1
         if progress_callback:
             progress_callback(processed_count, total_files, f"完了: {filename}")
-    
-    # 処理完了を報告
+
     if progress_callback:
         progress_callback(total_files, total_files, "処理完了")
 
-# 外部ファイルから呼び出された場合の処理
+
 if __name__ == "__main__":
     if len(sys.argv) > 4:
         folder_path = sys.argv[1]
