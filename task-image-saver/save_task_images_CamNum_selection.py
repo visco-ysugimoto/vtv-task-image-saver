@@ -82,7 +82,11 @@ def apply_filename_template(template, comment, tool_comment, original_name,
 
 def get_file_list(folder_path, extension='.txt'):
     """指定フォルダから指定拡張子のファイルリストを取得"""
-    return [f for f in os.listdir(folder_path) if f.endswith(extension)]
+    extension = extension.lower()
+    return [
+        f for f in os.listdir(folder_path)
+        if f.lower().endswith(extension)
+    ]
 
 
 def find_cam_and_div(filename):
@@ -166,7 +170,7 @@ def generate_new_file_name(img_info_dict, file_name, index, tool_comment,
                            is_duplicate_comment=False):
     """テンプレートを使用してファイル名を生成"""
     comment = img_info_dict.get('comment', '')
-    original_name = file_name.replace(".bmp", '')
+    original_name = os.path.splitext(file_name)[0]
     file_source = img_info_dict.get('fileName', '')
 
     if comment:
@@ -241,6 +245,37 @@ def copy_image_files(img_info_dict, output_folder, folder_path,
             os.path.join(folder_path, file_name),
             os.path.join(output_folder, new_filename),
         )
+
+
+def copy_raw_bmp_files(folder_path, output_folder, progress_callback=None,
+                       cancel_check=None):
+    """参照用txtがない場合に、imgフォルダ直下のBMPをそのままコピーする。"""
+    bmp_files = get_file_list(folder_path, '.bmp')
+    used_in_session = set()
+    os.makedirs(output_folder, exist_ok=True)
+
+    for i, file_name in enumerate(bmp_files, 1):
+        if cancel_check and cancel_check():
+            if progress_callback:
+                progress_callback(i - 1, len(bmp_files), "キャンセルされました")
+            return
+
+        base_name, ext = os.path.splitext(file_name)
+        new_filename = file_name
+        count = 2
+        while (new_filename in used_in_session
+               or os.path.exists(os.path.join(output_folder, new_filename))):
+            new_filename = f"{base_name}_{count}{ext}"
+            count += 1
+
+        used_in_session.add(new_filename)
+        shutil.copy(
+            os.path.join(folder_path, file_name),
+            os.path.join(output_folder, new_filename),
+        )
+
+        if progress_callback:
+            progress_callback(i, len(bmp_files), f"保存中: {file_name}")
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +373,17 @@ def process_images(folder_path, output_folder, save_mode, save_cam,
     total_files = len(file_list)
     processed_count = 0
 
+    if not file_list:
+        if save_mode == '0':
+            copy_raw_bmp_files(
+                folder_path, output_folder,
+                progress_callback=progress_callback,
+                cancel_check=cancel_check,
+            )
+        elif progress_callback:
+            progress_callback(0, 0, "参照用txtがないため保存対象がありません")
+        return
+
     for filename in file_list:
         if cancel_check and cancel_check():
             print("画像処理がキャンセルされました")
@@ -349,7 +395,7 @@ def process_images(folder_path, output_folder, save_mode, save_cam,
             progress_callback(processed_count, total_files, f"処理中: {filename}")
 
         file_path = os.path.join(folder_path, filename)
-        img_info_dict = {'fileName': filename.replace('.txt', '')}
+        img_info_dict = {'fileName': os.path.splitext(filename)[0]}
         file_name_list = []
         file_index[0] = 0
 
@@ -361,7 +407,9 @@ def process_images(folder_path, output_folder, save_mode, save_cam,
             print("adjust_CAM_list=")
             print(adjust_CAM_list)
             mapping_AB, mapping_BA = create_mapping(raw_cam_list, adjust_CAM_list)
-            print(f"変換要素：{list(get_original_from_converted([1, 1], mapping_AB))}")
+            sample_mapping = get_original_from_converted([1, 1], mapping_AB)
+            if sample_mapping is not None:
+                print(f"変換要素：{list(sample_mapping)}")
 
         if filename == first_file and save_cam == '1':
             if preselected_cam_list is not None:

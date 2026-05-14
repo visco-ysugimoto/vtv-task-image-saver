@@ -2,7 +2,6 @@ import flet as ft
 import os
 import sys
 import ctypes
-import shutil
 import zipfile
 import threading
 import traceback
@@ -21,7 +20,18 @@ from tkinter import filedialog
 import save_task_images_CamNum_selection
 from config import ConfigManager
 from PIL import Image
-from utils import format_value, convert_bmp_to_jpeg
+from utils import (
+    TASK_FILE_DIALOG_TYPES,
+    TASK_FILE_EXTENSIONS_LABEL,
+    TaskFolder,
+    convert_bmp_to_jpeg,
+    extract_ordered_bmp_paths_from_zip,
+    extract_task_file,
+    format_value,
+    is_task_file_path,
+    list_task_folders,
+    list_task_folders_with_metadata,
+)
 
 # Windows タスクバーで独自アイコンを表示するための AppUserModelID 設定
 if sys.platform == "win32":
@@ -166,12 +176,7 @@ def _select_file_dialog():
     root.attributes('-topmost', True)
     file = filedialog.askopenfilename(
         title="タスクファイルを選択",
-        filetypes=[
-            ("Task Files", "*.ziq"),
-            ("Task Files", "*.zit"),
-            ("Task Files", "*.zii"),
-            ("All Files", "*.*"),
-        ]
+        filetypes=TASK_FILE_DIALOG_TYPES
     )
     root.destroy()
     return file
@@ -184,28 +189,27 @@ def _select_file_dialog():
 OPTION_DESCRIPTIONS = {
     "option1": (
         "現在の選択:\n\nVTV9000上のタスクから\n(オフラインPC)"
-        "\n\n━━━━━━━━━━━━━━━━\n\n"
+        "\n\n━━━━━━━━━━━━━\n\n"
         "オフライン上にインストールされているVTV-9000内のタスクに格納されている"
         "画像ファイルを任意のオプションで保存します。\n\n"
         "タスクを保存しているグループ番号とタスク番号を入力してください。"
     ),
     "option2": (
-        "現在の選択:\n\nタスクファイルから\n(ziq, zit, zii)"
-        "\n\n━━━━━━━━━━━━━━━━\n\n"
-        "タスクファイル(ziq, zit, zii)に格納されている"
+        "現在の選択:\n\nタスクファイルから\n(ziq, zit, zii, zig, zia)"
+        "\n\n━━━━━━━━━━━━━\n\n"
+        "タスクファイル(ziq, zit, zii, zig, zia)に格納されている"
         "画像ファイルを任意のオプションで保存します。\n\n"
         "画像が格納されているタスクファイルを選択してください。"
     ),
     "option3": (
         "現在の選択:\n\nVTV9000上のタスクから\n(共有VTV)"
-        "\n\n━━━━━━━━━━━━━━━━\n\n"
+        "\n\n━━━━━━━━━━━━━\n\n"
         "ネットワーク上にインストールされているVTV-9000内のタスクに格納されている"
         "画像ファイルを任意のオプションで保存します。\n\n"
         "共有しているVTV-9000の「viscotech」フォルダを選択してください。\n"
         "また共有VTV-900側の画像を保存しているグループ番号とタスク番号を入力してください。"
     ),
 }
-
 
 # ---------------------------------------------------------------------------
 # アプリケーションクラス
@@ -224,6 +228,8 @@ class TaskImageSaverApp:
         self._processing_state = {}
         self._current_img_folder = ""
         self._current_output_folder = ""
+        self._current_task_save_jobs = []
+        self._current_cleanup_paths = []
         self._progress_dialog = None
         self._active_dialog = None
 
@@ -231,6 +237,10 @@ class TaskImageSaverApp:
         self._file_thumbnail_count = 0
         self._preview_zip_path = ""
         self._preview_bmp_names = []
+        self._last_option2_loaded_file = ""
+        self._option2_task_folders: list[TaskFolder] = []
+        self._option2_selected_task_prefix = None
+        self._option2_save_task_prefixes = set()
 
         self._init_refs()
         self._setup_page()
@@ -246,6 +256,11 @@ class TaskImageSaverApp:
         self.selected_option = ft.Ref[ft.RadioGroup]()
         self.folder_path = ft.Ref[ft.TextField]()
         self.file_path = ft.Ref[ft.TextField]()
+        self.option2_group_dropdown = ft.Ref[ft.Dropdown]()
+        self.option2_task_dropdown = ft.Ref[ft.Dropdown]()
+        self.option2_save_mode_radio = ft.Ref[ft.RadioGroup]()
+        self.option2_task_selection_column = ft.Ref[ft.Column]()
+        self.option2_save_selection_info = ft.Ref[ft.Text]()
         self.group_num_field = ft.Ref[ft.TextField]()
         self.task_num_field = ft.Ref[ft.TextField]()
         self.option3_folder_field = ft.Ref[ft.TextField]()
@@ -432,18 +447,317 @@ class TaskImageSaverApp:
         async def _run():
             file = await asyncio.to_thread(_select_file_dialog)
             if file:
-                self.file_path.current.value = file
-                self._show_thumbnail_loading()
-                self.page.update()
-                total, thumbnails, bmp_names = await asyncio.to_thread(
-                    self._extract_preview_thumbnails, file)
-                self._file_thumbnails = thumbnails
-                self._file_thumbnail_count = total
-                self._preview_zip_path = file
-                self._preview_bmp_names = bmp_names
-                self._update_thumbnail_display()
-                self.page.update()
+                await self._set_option2_task_file(file)
         self.page.run_task(_run)
+
+    @staticmethod
+    def _is_task_file_path(file_path: str) -> bool:
+        return is_task_file_path(file_path)
+
+    async def _set_option2_task_file(self, file_path: str):
+        """Option2 のタスクファイル選択後の共通処理（参照/ドロップ共通）"""
+        if not self._is_task_file_path(file_path):
+            self.warning_text.current.value = (
+                f"対応拡張子は {TASK_FILE_EXTENSIONS_LABEL} のみです"
+            )
+            self.page.update()
+            return
+
+        self.file_path.current.value = file_path
+        self.warning_text.current.value = ""
+        self._show_thumbnail_loading()
+        self.page.update()
+
+        task_folders = await asyncio.to_thread(
+            list_task_folders_with_metadata, file_path)
+        self._option2_task_folders = task_folders
+        self._option2_selected_task_prefix = (
+            task_folders[0].prefix if task_folders else None
+        )
+        self._option2_save_task_prefixes = {
+            folder.prefix for folder in task_folders
+        }
+        self._update_option2_task_selector_controls()
+        self._update_option2_save_task_controls()
+
+        total, thumbnails, bmp_names = await asyncio.to_thread(
+            self._extract_preview_thumbnails,
+            file_path,
+            self._option2_selected_task_prefix,
+        )
+        self._file_thumbnails = thumbnails
+        self._file_thumbnail_count = total
+        self._preview_zip_path = file_path
+        self._preview_bmp_names = bmp_names
+        self._last_option2_loaded_file = file_path
+        self._update_thumbnail_display()
+        self.page.update()
+
+    def _option2_group_labels(self):
+        labels = []
+        for folder in self._option2_task_folders:
+            group = self._task_folder_group(folder)
+            if group and group not in labels:
+                labels.append(group)
+        return labels
+
+    def _option2_task_labels_for_group(self, group: str):
+        return [
+            self._task_folder_task(folder)
+            for folder in self._option2_task_folders
+            if self._task_folder_group(folder) == group
+        ]
+
+    def _task_folder_group(self, folder: TaskFolder) -> str:
+        group, _, _task = folder.label.partition("/")
+        return group
+
+    def _task_folder_task(self, folder: TaskFolder) -> str:
+        _group, _sep, task = folder.label.partition("/")
+        return task
+
+    def _selected_option2_task_folder(self):
+        for folder in self._option2_task_folders:
+            if folder.prefix == self._option2_selected_task_prefix:
+                return folder
+        return None
+
+    def _selected_option2_save_task_folders(self):
+        if not self._option2_task_folders:
+            return []
+
+        mode_control = self.option2_save_mode_radio.current
+        save_mode = mode_control.value if mode_control else "all"
+        if save_mode != "selected":
+            return list(self._option2_task_folders)
+
+        selected_prefixes = self._option2_save_task_prefixes
+        return [
+            folder for folder in self._option2_task_folders
+            if folder.prefix in selected_prefixes
+        ]
+
+    def _dropdown_options(self, values):
+        return [ft.dropdown.Option(value) for value in values]
+
+    def _update_option2_task_selector_controls(self):
+        group_control = self.option2_group_dropdown.current
+        task_control = self.option2_task_dropdown.current
+        if not group_control or not task_control:
+            self._update_option2_save_task_controls()
+            return
+
+        groups = self._option2_group_labels()
+        selected = next(
+            (
+                folder for folder in self._option2_task_folders
+                if folder.prefix == self._option2_selected_task_prefix
+            ),
+            None,
+        )
+        selected_group = self._task_folder_group(selected) if selected else ""
+        if not selected_group and groups:
+            selected_group = groups[0]
+
+        tasks = self._option2_task_labels_for_group(selected_group)
+        selected_task = self._task_folder_task(selected) if selected else ""
+        if selected_task not in tasks:
+            selected_task = tasks[0] if tasks else ""
+
+        group_control.options = self._dropdown_options(groups)
+        group_control.value = selected_group
+        group_control.disabled = len(groups) <= 1
+        task_control.options = self._dropdown_options(tasks)
+        task_control.value = selected_task
+        task_control.disabled = len(tasks) <= 1
+        self._update_option2_save_task_controls()
+
+    def _option2_save_mode(self):
+        control = self.option2_save_mode_radio.current
+        return control.value if control else "all"
+
+    def _update_option2_save_task_controls(self):
+        selection_column = self.option2_task_selection_column.current
+        info_control = self.option2_save_selection_info.current
+        if not selection_column:
+            return
+
+        selection_column.controls.clear()
+        folders = self._option2_task_folders
+        if len(folders) <= 1:
+            selection_column.controls.append(
+                ft.Text("複数タスクを含むファイルで利用できます。",
+                        size=11, color=ft.Colors.GREY_500)
+            )
+            if info_control:
+                info_control.value = ""
+            return
+
+        save_mode = self._option2_save_mode()
+        if save_mode != "selected":
+            selection_column.controls.append(
+                ft.Text("全タスク保存中です。行クリックでサムネイルを確認できます。",
+                        size=11, color=ft.Colors.GREY_600)
+            )
+
+        current_prefix = self._option2_selected_task_prefix
+        for folder in folders:
+            is_current = folder.prefix == current_prefix
+            group = self._task_folder_group(folder)
+            task = self._task_folder_task(folder)
+            title = folder.title or "タイトルなし"
+            comment = folder.comment or ""
+            has_images = folder.image_count > 0
+            image_status = (
+                f"画像 {folder.image_count}枚" if has_images else "画像なし")
+            image_status_color = (
+                ft.Colors.GREEN_700 if has_images else ft.Colors.RED_700)
+            selection_column.controls.append(
+                ft.Container(
+                    bgcolor=(
+                        ft.Colors.BLUE_50 if is_current else ft.Colors.WHITE
+                    ),
+                    border=ft.border.all(
+                        1,
+                        ft.Colors.BLUE_200
+                        if is_current else ft.Colors.GREY_200,
+                    ),
+                    border_radius=6,
+                    padding=ft.padding.symmetric(horizontal=6, vertical=4),
+                    ink=True,
+                    on_click=lambda e, task_folder=folder:
+                        self._select_option2_task_folder(task_folder),
+                    content=ft.Row([
+                        ft.Checkbox(
+                            value=(
+                                folder.prefix
+                                in self._option2_save_task_prefixes
+                            ),
+                            disabled=(save_mode != "selected"),
+                            on_change=(
+                                lambda e, task_folder=folder:
+                                self._on_option2_save_task_changed(
+                                    task_folder, e.control.value)
+                            ),
+                        ),
+                        ft.Text(group, width=42, size=11,
+                                weight=ft.FontWeight.W_500),
+                        ft.Text(task, width=32, size=11),
+                        ft.Text(
+                            image_status,
+                            width=64,
+                            size=11,
+                            color=image_status_color,
+                            weight=ft.FontWeight.W_500,
+                        ),
+                        ft.Column([
+                            ft.Text(
+                                title, size=12,
+                                weight=ft.FontWeight.W_500,
+                                overflow=ft.TextOverflow.ELLIPSIS,
+                            ),
+                            ft.Text(
+                                comment, size=11,
+                                color=ft.Colors.GREY_700,
+                                overflow=ft.TextOverflow.ELLIPSIS,
+                            ),
+                        ], spacing=0, expand=True),
+                    ], spacing=4,
+                       vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                )
+            )
+
+        if info_control:
+            selected_count = len(self._selected_option2_save_task_folders())
+            total_count = len(folders)
+            info_control.value = (
+                f"保存対象: {selected_count} / {total_count} タスク")
+
+    def _select_option2_task_folder(self, folder):
+        self.page.run_task(self._load_option2_task_preview, folder.prefix)
+
+    def _on_option2_save_mode_changed(self, e):
+        if e.control.value == "all":
+            self._option2_save_task_prefixes = {
+                folder.prefix for folder in self._option2_task_folders
+            }
+        elif not self._option2_save_task_prefixes:
+            selected = self._selected_option2_task_folder()
+            if selected:
+                self._option2_save_task_prefixes = {selected.prefix}
+        self._update_option2_save_task_controls()
+        self.page.update()
+
+    def _on_option2_save_task_changed(self, folder, value):
+        if value:
+            self._option2_save_task_prefixes.add(folder.prefix)
+        else:
+            self._option2_save_task_prefixes.discard(folder.prefix)
+        self._update_option2_save_task_controls()
+        self.page.update()
+        if value:
+            self._select_option2_task_folder(folder)
+
+    def _set_option2_group_task_checked(self, checked: bool):
+        for folder in self._option2_task_folders:
+            if checked:
+                self._option2_save_task_prefixes.add(folder.prefix)
+            else:
+                self._option2_save_task_prefixes.discard(folder.prefix)
+        self._update_option2_save_task_controls()
+        self.page.update()
+
+    def _on_option2_group_changed(self, e):
+        group = e.control.value
+        tasks = self._option2_task_labels_for_group(group)
+        task_control = self.option2_task_dropdown.current
+        if task_control:
+            task_control.options = self._dropdown_options(tasks)
+            task_control.value = tasks[0] if tasks else ""
+            task_control.disabled = len(tasks) <= 1
+        self._update_option2_save_task_controls()
+        self.page.update()
+        self.page.run_task(self._reload_option2_selected_task_preview)
+
+    def _on_option2_task_changed(self, e):
+        self.page.run_task(self._reload_option2_selected_task_preview)
+
+    async def _reload_option2_selected_task_preview(self):
+        selected = self._selected_option2_task_folder()
+        if not selected or selected.prefix == self._option2_selected_task_prefix:
+            self._update_option2_save_task_controls()
+            self.page.update()
+            return
+        await self._load_option2_task_preview(selected.prefix)
+
+    async def _load_option2_task_preview(self, task_prefix):
+        selected = next(
+            (
+                folder for folder in self._option2_task_folders
+                if folder.prefix == task_prefix
+            ),
+            None,
+        )
+        if not selected:
+            return
+        self._option2_selected_task_prefix = selected.prefix
+        self._update_option2_save_task_controls()
+        self._show_thumbnail_loading()
+        self.page.update()
+
+        file_path = self.file_path.current.value if self.file_path.current else ""
+        total, thumbnails, bmp_names = await asyncio.to_thread(
+            self._extract_preview_thumbnails,
+            file_path,
+            self._option2_selected_task_prefix,
+        )
+        self._file_thumbnails = thumbnails
+        self._file_thumbnail_count = total
+        self._preview_zip_path = file_path
+        self._preview_bmp_names = bmp_names
+        self._update_thumbnail_display()
+        self._update_option2_save_task_controls()
+        self.page.update()
 
     def _save_large_image_to_temp(self, bmp_index):
         """zipから画像を取得し一時ファイルに保存してパスを返す"""
@@ -551,9 +865,9 @@ class TaskImageSaverApp:
         )
         self.page.show_dialog(dialog)
 
-    def _extract_preview_thumbnails(self, zip_path, max_images=6,
+    def _extract_preview_thumbnails(self, zip_path, task_prefix=None, max_images=6,
                                      thumb_size=(100, 100)):
-        """タスクファイル(zip)から最初のtxtに紐づく代表画像のサムネイルを取得する。
+        """タスクファイルから選択タスクの代表画像サムネイルを取得する。
         ファイルを展開せずにzip内を直接読み取る。並列処理で高速化。"""
         thumbnails = []
         bmp_names_out = []
@@ -574,52 +888,14 @@ class TaskImageSaverApp:
                 return (idx, None, full_path)
 
         try:
-            with zipfile.ZipFile(zip_path, 'r') as zf:
-                all_names = [n.replace('\\', '/') for n in zf.namelist()]
+            ordered_bmps = extract_ordered_bmp_paths_from_zip(zip_path, task_prefix)
+            total = len(ordered_bmps)
+            if not ordered_bmps:
+                return total, thumbnails, bmp_names_out
 
-                img_prefix = None
-                for n in all_names:
-                    if '/img/' in n:
-                        idx = n.index('/img/')
-                        img_prefix = n[:idx + 5]
-                        break
-                if not img_prefix:
-                    return total, thumbnails, bmp_names_out
-
-                txt_files = sorted([
-                    n for n in all_names
-                    if n.startswith(img_prefix)
-                    and n.lower().endswith('.txt')
-                ])
-                if not txt_files:
-                    return total, thumbnails, bmp_names_out
-
-                first_txt = txt_files[0]
-                referenced_bmps = []
-                with zf.open(first_txt) as f:
-                    for raw_line in f:
-                        line = raw_line.decode('utf-8', errors='ignore')
-                        if 'FILE=' in line:
-                            bmp_name = line.split('FILE=', 1)[1].strip()
-                            referenced_bmps.append(bmp_name)
-
-                total = len(referenced_bmps)
-                if not referenced_bmps:
-                    return total, thumbnails, bmp_names_out
-
-                step = max(1, len(referenced_bmps) // max_images)
-                selected = referenced_bmps[::step][:max_images]
-
-                bmp_lookup = {}
-                for n in all_names:
-                    if n.startswith(img_prefix) and n.lower().endswith('.bmp'):
-                        bmp_lookup[n.rsplit('/', 1)[-1]] = n
-
-                to_process = []
-                for i, bmp_basename in enumerate(selected):
-                    full_path = bmp_lookup.get(bmp_basename)
-                    if full_path:
-                        to_process.append((i, full_path))
+            step = max(1, len(ordered_bmps) // max_images)
+            selected = ordered_bmps[::step][:max_images]
+            to_process = [(i, full_path) for i, full_path in enumerate(selected)]
 
             if not to_process:
                 return total, thumbnails, bmp_names_out
@@ -659,12 +935,20 @@ class TaskImageSaverApp:
     def _load_file_thumbnails(self, file_path):
         """選択されたタスクファイルの代表画像サムネイルを読み込んで表示"""
         total, thumbnails, bmp_names = self._extract_preview_thumbnails(
-            file_path)
+            file_path, self._option2_selected_task_prefix)
         self._file_thumbnails = thumbnails
         self._file_thumbnail_count = total
         self._preview_zip_path = file_path
         self._preview_bmp_names = bmp_names
         self._update_thumbnail_display()
+
+    def _task_output_folder(self, base_output_folder: str, folder: TaskFolder) -> str:
+        group = self._task_folder_group(folder)
+        task = self._task_folder_task(folder)
+        return os.path.join(base_output_folder, group, task)
+
+    def _is_multi_task_file(self) -> bool:
+        return len(self._option2_task_folders) > 1
 
     def _update_thumbnail_display(self):
         """サムネイル行コントロールを現在のキャッシュで更新する"""
@@ -728,6 +1012,11 @@ class TaskImageSaverApp:
         self._file_thumbnail_count = 0
         self._preview_zip_path = ""
         self._preview_bmp_names = []
+        self._option2_task_folders = []
+        self._option2_selected_task_prefix = None
+        self._option2_save_task_prefixes = set()
+        self._current_task_save_jobs = []
+        self._current_cleanup_paths = []
 
         if option == "option1":
             self.dynamic_content.current.controls.extend(
@@ -744,7 +1033,7 @@ class TaskImageSaverApp:
         """グループ番号・タスク番号入力フィールドを生成"""
         return [
             ft.Row([
-                ft.Text("グループ番号:", width=100, size=13),
+                ft.Text("グループ番号:", width=100, size=14),
                 ft.TextField(
                     ref=self.group_num_field, expand=True, hint_text="例: 1",
                     border_radius=6, text_size=13,
@@ -754,7 +1043,7 @@ class TaskImageSaverApp:
                 ft.Container(width=93),
             ]),
             ft.Row([
-                ft.Text("タスク番号:", width=100, size=13),
+                ft.Text("タスク番号:", width=100, size=14),
                 ft.TextField(
                     ref=self.task_num_field, expand=True, hint_text="例: 1",
                     border_radius=6, text_size=13,
@@ -794,12 +1083,12 @@ class TaskImageSaverApp:
                 f" ({self._file_thumbnail_count}枚の画像を検出):")
 
         return [
-            ft.Text("ファイル選択 (ziq, zit, zii):", size=13),
+            ft.Text("ファイル選択 (ziq, zit, zii, zig, zia)", size=14),
             ft.Row([
                 ft.TextField(
                     ref=self.file_path, expand=True,
                     hint_text="タスクファイルを選択...",
-                    border_radius=6, text_size=13,
+                    border_radius=6, text_size=14,
                     content_padding=ft.padding.only(
                         left=10, right=10, top=6, bottom=6),
                 ),
@@ -807,6 +1096,51 @@ class TaskImageSaverApp:
                     "参照", icon=ft.Icons.FOLDER_OPEN,
                     on_click=self._pick_file),
             ]),
+            ft.Text(
+                "※ タスク一覧の行をクリックすると、確認用サムネイルが更新されます。",
+                size=11, color=ft.Colors.GREY_600),
+            ft.Container(
+                bgcolor=ft.Colors.GREY_50,
+                border=ft.border.all(1, ft.Colors.GREY_200),
+                border_radius=8,
+                padding=10,
+                content=ft.Column([
+                    ft.Text("保存対象タスク", size=13,
+                            weight=ft.FontWeight.W_500),
+                    ft.RadioGroup(
+                        ref=self.option2_save_mode_radio,
+                        value="all",
+                        on_change=self._on_option2_save_mode_changed,
+                        content=ft.Row([
+                            ft.Radio(value="all", label="全タスク"),
+                            ft.Radio(value="selected", label="選択したタスクのみ"),
+                        ], spacing=4),
+                    ),
+                    ft.Row([
+                        ft.TextButton(
+                            "全選択",
+                            on_click=lambda e:
+                                self._set_option2_group_task_checked(True)),
+                        ft.TextButton(
+                            "全解除",
+                            on_click=lambda e:
+                                self._set_option2_group_task_checked(False)),
+                    ], spacing=0),
+                    ft.Text(
+                        ref=self.option2_save_selection_info,
+                        value="", size=11, color=ft.Colors.GREY_700),
+                    ft.Column(
+                        ref=self.option2_task_selection_column,
+                        controls=[
+                            ft.Text("タスクファイルを選択してください。",
+                                    size=11, color=ft.Colors.GREY_500)
+                        ],
+                        spacing=0,
+                        height=260,
+                        scroll=ft.ScrollMode.AUTO,
+                    ),
+                ], spacing=4),
+            ),
             ft.Container(height=5),
             ft.Text(
                 ref=self.thumbnail_info, value=info_text,
@@ -833,7 +1167,7 @@ class TaskImageSaverApp:
         fields = self._build_group_task_fields()
         fields.extend([
             ft.Container(height=5),
-            ft.Text("共有VTVフォルダ選択:", size=13),
+            ft.Text("共有VTVフォルダ選択:", size=14),
             ft.Row([
                 ft.TextField(
                     ref=self.option3_folder_field, expand=True,
@@ -1131,11 +1465,19 @@ class TaskImageSaverApp:
             self.compression_label_ref.current.value = f"現在の値: {value}"
             self.page.update()
 
-    def _show_settings_dialog(self, img_folder_path: str, output_folder: str):
+    def _show_settings_dialog(
+        self,
+        img_folder_path: str,
+        output_folder: str,
+        task_save_jobs=None,
+        cleanup_paths=None,
+    ):
         """設定ダイアログを表示"""
         self.app_state['is_dialog_open'] = True
         self._current_img_folder = img_folder_path
         self._current_output_folder = output_folder
+        self._current_task_save_jobs = task_save_jobs or []
+        self._current_cleanup_paths = cleanup_paths or []
 
         now = datetime.now()
         preview_original_default = (
@@ -1376,6 +1718,54 @@ class TaskImageSaverApp:
     # 進捗管理 & 画像処理
     # ==================================================================
 
+    def _snapshot_output_files(self, output_folder):
+        """出力先配下のファイルを相対パスで取得する。"""
+        existing_files = set()
+        if not os.path.exists(output_folder):
+            return existing_files
+        for walk_root, _dirs, files in os.walk(output_folder):
+            for file_name in files:
+                full_path = os.path.join(walk_root, file_name)
+                existing_files.add(os.path.relpath(full_path, output_folder))
+        return existing_files
+
+    def _cleanup_extracted_task_folders(self, cleanup_paths):
+        """タスクファイル展開時に作成した作業フォルダを削除する。"""
+        for cleanup_path in cleanup_paths:
+            if not cleanup_path or not os.path.isdir(cleanup_path):
+                continue
+            try:
+                entries = []
+                for walk_root, dirs, files in os.walk(cleanup_path, topdown=False):
+                    for file_name in files:
+                        entries.append(os.path.join(walk_root, file_name))
+                    for dir_name in dirs:
+                        entries.append(os.path.join(walk_root, dir_name))
+                entries.append(cleanup_path)
+
+                total = len(entries)
+                self._update_progress(
+                    0, total, "展開フォルダを削除中...")
+
+                for index, entry_path in enumerate(entries, 1):
+                    if os.path.isfile(entry_path) or os.path.islink(entry_path):
+                        os.unlink(entry_path)
+                    elif os.path.isdir(entry_path):
+                        os.rmdir(entry_path)
+
+                    rel_path = os.path.relpath(entry_path, cleanup_path)
+                    self._update_progress(
+                        index,
+                        total,
+                        f"展開フォルダ削除中:\n{rel_path}",
+                    )
+
+                self._update_progress(
+                    total, total, "展開フォルダ削除完了")
+                print(f"展開フォルダを削除しました: {cleanup_path}")
+            except Exception as ex:
+                print(f"展開フォルダの削除に失敗しました: {cleanup_path} - {ex}")
+
     def _show_progress_dialog(self):
         """進捗ダイアログを表示"""
         def on_cancel_click(e):
@@ -1580,6 +1970,14 @@ class TaskImageSaverApp:
         ps = self._processing_state
         img_folder_path = self._current_img_folder
         output_folder = self._current_output_folder
+        cleanup_paths = list(self._current_cleanup_paths)
+        task_save_jobs = self._current_task_save_jobs or [
+            {
+                'label': '',
+                'img_folder_path': img_folder_path,
+                'output_folder': output_folder,
+            }
+        ]
 
         if ps.get('started'):
             print("警告: 処理は既に開始されています。重複実行をスキップします。")
@@ -1597,36 +1995,54 @@ class TaskImageSaverApp:
             return ps['cancelled']
 
         def run_processing():
-            print(f"処理スレッド開始: img_folder={img_folder_path}, "
+            print(f"処理スレッド開始: {len(task_save_jobs)}タスク, "
                   f"output={output_folder}")
             try:
-                save_task_images_CamNum_selection.process_images(
-                    img_folder_path, output_folder, save_mode, save_cam,
-                    preselected_cam_list=selected_cam_list,
-                    progress_callback=self._update_progress,
-                    filename_templates=filename_templates,
-                    cancel_check=check_cancelled,
-                )
-
-                if ps['cancelled']:
-                    print("処理スレッド: キャンセルされました")
-                    return
-
-                print("画像処理完了")
-
-                if 0 < compression < 100:
-                    print("圧縮処理開始")
-                    convert_bmp_to_jpeg(
-                        output_folder, compression,
-                        progress_callback=self._update_progress,
-                        cancel_check=check_cancelled)
-
+                for job_index, job in enumerate(task_save_jobs, 1):
                     if ps['cancelled']:
-                        print("処理スレッド: 圧縮中にキャンセルされました")
+                        print("処理スレッド: キャンセルされました")
                         return
 
-                    print("圧縮処理完了")
+                    job_label = job.get('label') or f"task{job_index}"
+                    job_img_folder = job['img_folder_path']
+                    job_output_folder = job['output_folder']
+                    os.makedirs(job_output_folder, exist_ok=True)
 
+                    def job_progress(current, total, message,
+                                     label=job_label, index=job_index):
+                        self._update_progress(
+                            current,
+                            total,
+                            f"[{index}/{len(task_save_jobs)} {label}] {message}",
+                        )
+
+                    print(f"画像処理開始: {job_label} -> {job_output_folder}")
+                    save_task_images_CamNum_selection.process_images(
+                        job_img_folder, job_output_folder, save_mode, save_cam,
+                        preselected_cam_list=selected_cam_list,
+                        progress_callback=job_progress,
+                        filename_templates=filename_templates,
+                        cancel_check=check_cancelled,
+                    )
+
+                    if ps['cancelled']:
+                        print("処理スレッド: キャンセルされました")
+                        return
+
+                    if 0 < compression < 100:
+                        print(f"圧縮処理開始: {job_label}")
+                        convert_bmp_to_jpeg(
+                            job_output_folder, compression,
+                            progress_callback=job_progress,
+                            cancel_check=check_cancelled)
+
+                        if ps['cancelled']:
+                            print("処理スレッド: 圧縮中にキャンセルされました")
+                            return
+
+                        print(f"圧縮処理完了: {job_label}")
+
+                print("画像処理完了")
                 print("処理スレッド: completed = True を設定")
                 ps['completed'] = True
 
@@ -1643,11 +2059,13 @@ class TaskImageSaverApp:
                 ps['error'] = f"{type(ex).__name__}: {ex}"
 
             finally:
-                if os.path.exists(output_folder):
-                    current_files = set(os.listdir(output_folder))
-                    new_files = current_files - ps.get('existing_files', set())
-                    ps['created_files'] = list(new_files)
-                    print(f"新しく作成されたファイル: {len(new_files)}件")
+                if ps.get('completed') and cleanup_paths:
+                    self._cleanup_extracted_task_folders(cleanup_paths)
+
+                current_files = self._snapshot_output_files(output_folder)
+                new_files = current_files - ps.get('existing_files', set())
+                ps['created_files'] = list(new_files)
+                print(f"新しく作成されたファイル: {len(new_files)}件")
 
                 print(f"処理スレッド終了: completed={ps['completed']}, "
                       f"error={ps['error']}, cancelled={ps['cancelled']}")
@@ -1661,10 +2079,7 @@ class TaskImageSaverApp:
             'output_folder': output_folder,
         })
 
-        existing_files = set()
-        if os.path.exists(output_folder):
-            existing_files = set(os.listdir(output_folder))
-        ps['existing_files'] = existing_files
+        ps['existing_files'] = self._snapshot_output_files(output_folder)
 
         self._show_progress_dialog()
 
@@ -1763,31 +2178,66 @@ class TaskImageSaverApp:
     def _handle_option2(self, task_file: str, output_folder: str):
         """Option2: タスクファイルの展開と設定ダイアログ表示"""
         loading_text_ref = ft.Ref[ft.Text]()
-        loading_result = {'img_folder_path': None, 'error': None}
+        loading_result = {
+            'img_folder_path': None,
+            'task_save_jobs': None,
+            'cleanup_paths': [],
+            'error': None,
+        }
+        selected_task_prefix = self._option2_selected_task_prefix
+        save_target_mode = self._option2_save_mode()
+        selected_save_prefixes = set(self._option2_save_task_prefixes)
 
         def process_task_file():
             try:
-                loading_result['status'] = "タスクファイルをコピー中..."
-                copied_file_path = shutil.copy(task_file, output_folder)
-                zip_file_path = (
-                    os.path.splitext(copied_file_path)[0] + ".zip")
-                os.rename(copied_file_path, zip_file_path)
-
                 loading_result['status'] = "タスクファイルを展開中..."
-                with zipfile.ZipFile(zip_file_path, "r") as zip_ref:
-                    zip_ref.extractall(output_folder)
+                task_folders = self._option2_task_folders
+                if self._last_option2_loaded_file != task_file:
+                    task_folders = list_task_folders_with_metadata(task_file)
+                multi_task = len(task_folders) > 1
+                if multi_task:
+                    extract_task_file(task_file, output_folder)
+                    loading_result['cleanup_paths'] = [
+                        os.path.join(output_folder, "viscotech")
+                    ]
+                    target_folders = task_folders
+                    if save_target_mode == "selected":
+                        target_folders = [
+                            folder for folder in task_folders
+                            if folder.prefix in selected_save_prefixes
+                        ]
+                    if not target_folders:
+                        loading_result['error'] = "保存対象タスクを選択してください。"
+                        return
 
-                os.remove(zip_file_path)
-
-                loading_result['status'] = "画像フォルダを検索中..."
-                viscotech_folder_path = os.path.join(
-                    output_folder, "viscotech")
-
-                found_img_path = None
-                for walk_root, dirs, files in os.walk(viscotech_folder_path):
-                    if "img" in dirs:
-                        found_img_path = os.path.join(walk_root, "img")
-                        break
+                    task_save_jobs = []
+                    for folder in target_folders:
+                        img_path = os.path.join(
+                            output_folder,
+                            folder.prefix.replace("/", os.sep),
+                            "img",
+                        )
+                        if os.path.exists(img_path):
+                            task_save_jobs.append({
+                                'label': folder.label,
+                                'img_folder_path': img_path,
+                                'output_folder': self._task_output_folder(
+                                    output_folder, folder),
+                            })
+                    if task_save_jobs:
+                        loading_result['task_save_jobs'] = task_save_jobs
+                        found_img_path = task_save_jobs[0]['img_folder_path']
+                    else:
+                        found_img_path = None
+                else:
+                    found_img_path = extract_task_file(
+                        task_file,
+                        output_folder,
+                        selected_task_prefix,
+                    )
+                    loading_result['cleanup_paths'] = [
+                        os.path.join(output_folder, "viscotech")
+                    ]
 
                 if not found_img_path:
                     loading_result['error'] = "imgフォルダが見つかりませんでした。"
@@ -1817,7 +2267,11 @@ class TaskImageSaverApp:
                 self.page.update()
             else:
                 self._show_settings_dialog(
-                    loading_result['img_folder_path'], output_folder)
+                    loading_result['img_folder_path'],
+                    output_folder,
+                    loading_result.get('task_save_jobs'),
+                    loading_result.get('cleanup_paths'),
+                )
 
         loading_dialog = ft.AlertDialog(
             modal=True,
@@ -1855,12 +2309,12 @@ class TaskImageSaverApp:
             padding=15,
             alignment=ft.Alignment(-1, -1),
             content=ft.Column([
-                ft.Text("情報パネル", size=14, weight=ft.FontWeight.BOLD),
+                ft.Text("タスク画像保存フロー", size=18, weight=ft.FontWeight.BOLD),
                 ft.Divider(),
                 ft.Text(
                     ref=self.info_text,
                     value=OPTION_DESCRIPTIONS["option1"],
-                    size=11,
+                    size=14,
                 ),
             ],
             scroll=ft.ScrollMode.AUTO,
@@ -1874,14 +2328,14 @@ class TaskImageSaverApp:
             padding=ft.padding.only(left=20, right=20, top=15, bottom=15),
             alignment=ft.Alignment(-1, -1),
             content=ft.Column([
-                ft.Text("タスク画像保存フロー",
-                        size=20, weight=ft.FontWeight.BOLD),
-                ft.Container(
-                    height=2, bgcolor=ft.Colors.BLUE, border_radius=2),
-                ft.Container(height=10),
+                ##ft.Text("タスク画像保存フロー",
+                ##        size=20, weight=ft.FontWeight.BOLD),
+                ##ft.Container(
+                #    height=2, bgcolor=ft.Colors.BLUE, border_radius=2),
+                ##ft.Container(height=10),
 
                 ft.Text("インポート先を選択",
-                        size=14, weight=ft.FontWeight.W_500),
+                        size=15, weight=ft.FontWeight.W_500),
                 ft.Container(
                     bgcolor=ft.Colors.GREY_50, padding=10, border_radius=8,
                     content=ft.RadioGroup(
@@ -1891,7 +2345,7 @@ class TaskImageSaverApp:
                             ft.Radio(value="option1",
                                      label="VTV9000上のタスクから (オフラインPC)"),
                             ft.Radio(value="option2",
-                                     label="タスクファイルから (ziq, zit, zii)"),
+                                     label="タスクファイルから (ziq, zit, zii, zig, zia)"),
                             ft.Radio(value="option3",
                                      label="VTV9000上のタスクから (共有VTV)"),
                         ], spacing=2),
@@ -1900,7 +2354,7 @@ class TaskImageSaverApp:
                 ft.Container(height=8),
 
                 ft.Text("画像を保存するフォルダを選択",
-                        size=14, weight=ft.FontWeight.W_500),
+                        size=15, weight=ft.FontWeight.W_500),
                 ft.Row([
                     ft.TextField(
                         ref=self.folder_path, expand=True,

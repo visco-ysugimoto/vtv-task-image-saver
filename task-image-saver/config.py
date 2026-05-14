@@ -30,8 +30,15 @@ class Constants:
     IMG_FOLDER = "img"
     
     # ファイル拡張子
-    TASK_FILE_EXTENSIONS = [("Task Files", "*.ziq"), ("Task Files", "*.zit"), 
-                           ("Task Files", "*.zii"), ("All Files", "*.*")]
+    TASK_FILE_EXTENSIONS = [
+        ("Task Files", "*.ziq"),
+        ("Task Files", "*.zit"),
+        ("Task Files", "*.zii"),
+        ("Task Files", "*.zig"),
+        ("Task Files", "*.zia"),
+        ("ZIP Files", "*.zip"),
+        ("All Files", "*.*"),
+    ]
     BMP_EXTENSION = ".bmp"
     JPG_EXTENSION = ".jpg"
     TXT_EXTENSION = ".txt"

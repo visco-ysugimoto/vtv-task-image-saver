@@ -2,6 +2,8 @@
 # =========================================
 # TaskImageSaver を Windows exe にビルドするスクリプト
 
+Push-Location $PSScriptRoot
+try {
 Write-Host "=== TaskImageSaver ビルドスクリプト ===" -ForegroundColor Cyan
 Write-Host ""
 
@@ -64,3 +66,7 @@ if (Test-Path ".\dist\TaskImageSaver\TaskImageSaver.exe") {
 
 Write-Host ""
 Write-Host "ビルド完了!" -ForegroundColor Cyan
+}
+finally {
+    Pop-Location
+}
