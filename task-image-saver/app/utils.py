@@ -537,15 +537,12 @@ def pick_sample_paths(
     all_paths: list[str],
     max_images: Optional[int],
 ) -> list[str]:
-    """表示上限。None なら全件。超える場合は等間隔に間引く。"""
+    """表示上限。None なら全件。超える場合は先頭から昇順で max_images 件。"""
     if not all_paths:
         return []
     if max_images is None:
         return list(all_paths)
-    if len(all_paths) <= max_images:
-        return list(all_paths)
-    step = max(1, len(all_paths) // max_images)
-    return all_paths[::step][:max_images]
+    return list(all_paths[:max_images])
 
 
 def parse_task_version_text(raw_text: str) -> Optional[str]:
