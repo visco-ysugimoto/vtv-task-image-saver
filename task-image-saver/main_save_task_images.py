@@ -86,7 +86,9 @@ def convert_bmp_to_jpeg(folder, quality=85):
             jpg_path = os.path.join(folder, jpg_filename)
 
             # 画像を開いてJPEGに変換
-            with Image.open(bmp_path) as img:
+            from security_limits import open_image_file
+
+            with open_image_file(bmp_path) as img:
                 img = img.convert("RGB")  # JPEGはRGBモードをサポート
                 img.save(jpg_path, "JPEG", quality=quality)
 
@@ -148,8 +150,10 @@ def on_ok():
                 os.rename(copied_file_path, zip_file_path)
 
                 # .zipファイルを解凍
+                from security_limits import safe_zip_extractall
+
                 with zipfile.ZipFile(zip_file_path, "r") as zip_ref:
-                    zip_ref.extractall(folder_var.get())
+                    safe_zip_extractall(zip_ref, folder_var.get())
 
                 # 解凍が完了したら元の.zipファイルを削除
                 os.remove(zip_file_path)

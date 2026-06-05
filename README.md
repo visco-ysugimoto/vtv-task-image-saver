@@ -129,15 +129,21 @@ cd .\task-file-previewer
 
 ### 右クリックメニュー連携（アプリ未起動でも開く）
 
-`TaskFilePreviewer.exe` を右クリックメニューから直接開けるようにできます。  
-対象拡張子は既定で `.ziq` / `.zit` / `.zii` です（`-IncludeZip` で `.zip` も追加可能）。
+**TaskImageSaver（推奨）** — プレビュー確認後、そのまま保存フローへ進めます。
 
-登録:
+```powershell
+cd .\task-image-saver
+.\register_task_image_saver_context_menu.ps1
+```
+
+**TaskFilePreviewer（プレビュー専用・従来）** — 確認のみの場合。
 
 ```powershell
 cd .\task-file-previewer
 .\register_task_file_previewer_context_menu.ps1
 ```
+
+対象拡張子は既定で `.ziq` / `.zit` / `.zii` / `.zig` / `.zia` です（`-IncludeZip` で `.zip` も追加可能）。
 
 `dist` 以外に exe がある場合:
 

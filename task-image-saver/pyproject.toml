@@ -1,0 +1,40 @@
+[project]
+name = "task-image-saver"
+version = "1.0.19"
+description = "VTVタスク画像保存 (Flet)"
+requires-python = ">=3.10"
+dependencies = [
+    "flet>=0.80.0,<0.86.0",
+    "flet-desktop>=0.80.0",
+    "flet-dropzone>=0.3.1",
+    "Pillow>=10.0.0",
+]
+
+[tool.flet]
+org = "com.visco"
+product = "TaskImageSaver"
+artifact = "TaskImageSaver"
+company = "VISCO"
+copyright = "Copyright (C) VISCO"
+
+[tool.flet.app]
+path = "."
+module = "main_save_task_images_flet"
+exclude = [
+    "build",
+    "dist",
+    "backup_*",
+    "__pycache__",
+    "*.spec",
+    "theme",
+    "azure.tcl",
+    "build_*.ps1",
+    "build_*.cmd",
+    "package_release.*",
+    "build_dropzone_log*.txt",
+    "RELEASE_README.txt",
+    "main_save_task_images.py",
+    "main_save_task_images_nocompress.py",
+    "selection_window.py",
+    "dynamic_gui_CamNum_selection.py",
+]

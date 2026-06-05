@@ -9,6 +9,13 @@ from pathlib import Path
 from typing import Optional, Callable
 from PIL import Image
 
+from security_limits import (
+    MAX_ZIP_TEXT_BYTES,
+    open_image_file,
+    read_zip_member,
+    safe_zip_extractall,
+)
+
 
 TASK_FILE_EXTENSIONS = (".ziq", ".zit", ".zii", ".zig", ".zia", ".zip")
 TASK_FILE_DIALOG_TYPES = [
@@ -34,6 +41,16 @@ class TaskFolder:
     comment: str = ""
     updated_at: str = ""
     image_count: int = 0
+
+
+@dataclass
+class TaskZipMetadata:
+    """タスク ZIP 内の ver.txt / info.txt から得た表示用メタデータ。"""
+
+    version: Optional[str] = None
+    title: Optional[str] = None
+    comment: Optional[str] = None
+    last_updated: Optional[str] = None
 
 
 def format_value(value: str) -> str:
@@ -91,7 +108,7 @@ def convert_bmp_to_jpeg(folder: str, quality: int = 85,
         try:
             jpg_file = bmp_file.with_suffix(".jpg")
 
-            with Image.open(bmp_file) as img:
+            with open_image_file(bmp_file) as img:
                 img = img.convert("RGB")
                 img.save(jpg_file, "JPEG", quality=quality)
 
@@ -138,8 +155,11 @@ def list_task_folders_with_metadata(task_file_path: str) -> list[TaskFolder]:
             if not info_path:
                 continue
             try:
-                with zip_ref.open(norm_to_raw.get(info_path, info_path)) as info_file:
-                    raw_text = info_file.read().decode("utf-8", errors="ignore")
+                raw_text = read_zip_member(
+                    zip_ref,
+                    norm_to_raw.get(info_path, info_path),
+                    max_bytes=MAX_ZIP_TEXT_BYTES,
+                ).decode("utf-8-sig", errors="ignore")
                 title, comment, updated_at = parse_task_info_txt(raw_text)
                 folder.title = title or ""
                 folder.comment = comment or ""
@@ -191,13 +211,17 @@ def extract_ordered_bmp_paths_from_zip(
             return bmp_files
 
         referenced_names: list[str] = []
-        with zip_ref.open(norm_to_raw.get(txt_files[0], txt_files[0])) as txt:
-            for raw_line in txt:
-                line = raw_line.decode("utf-8", errors="ignore")
-                if "FILE=" in line:
-                    bmp_name = line.split("FILE=", 1)[1].strip()
-                    if bmp_name:
-                        referenced_names.append(bmp_name)
+        txt_bytes = read_zip_member(
+            zip_ref,
+            norm_to_raw.get(txt_files[0], txt_files[0]),
+            max_bytes=MAX_ZIP_TEXT_BYTES,
+        )
+        for raw_line in txt_bytes.splitlines(keepends=True):
+            line = raw_line.decode("utf-8", errors="ignore")
+            if "FILE=" in line:
+                bmp_name = line.split("FILE=", 1)[1].strip()
+                if bmp_name:
+                    referenced_names.append(bmp_name)
 
         bmp_lookup = {
             os.path.basename(name).lower(): norm_to_raw.get(name, name)
@@ -235,14 +259,23 @@ def _find_task_info_path(
     normalized_names: list[str],
     task_prefix: str,
 ) -> Optional[str]:
-    expected = task_prefix.rstrip("/") + "/info.txt"
+    """viscotech/task/gXX/YY/info.txt。直接パスに加え img 隣接も探す。"""
+    normalized_prefix = task_prefix.rstrip("/")
+    expected = f"{normalized_prefix}/info.txt"
     for name in normalized_names:
         if name.lower() == expected.lower():
             return name
-    prefix = task_prefix.rstrip("/") + "/"
+    prefix = normalized_prefix + "/"
     for name in normalized_names:
         if name.startswith(prefix) and os.path.basename(name).lower() == "info.txt":
             return name
+
+    img_prefix = _find_img_prefix(normalized_names, task_prefix)
+    if img_prefix and img_prefix.endswith("img/"):
+        candidate = img_prefix[: -len("img/")] + "info.txt"
+        for name in normalized_names:
+            if name.lower() == candidate.lower():
+                return name
     return None
 
 
@@ -500,6 +533,94 @@ def _format_datetime_at(parts: list[str], index: int) -> Optional[str]:
     return f"{year:04d}/{month:02d}/{day:02d} {hour:02d}:{minute:02d}"
 
 
+def pick_sample_paths(
+    all_paths: list[str],
+    max_images: Optional[int],
+) -> list[str]:
+    """表示上限。None なら全件。超える場合は等間隔に間引く。"""
+    if not all_paths:
+        return []
+    if max_images is None:
+        return list(all_paths)
+    if len(all_paths) <= max_images:
+        return list(all_paths)
+    step = max(1, len(all_paths) // max_images)
+    return all_paths[::step][:max_images]
+
+
+def parse_task_version_text(raw_text: str) -> Optional[str]:
+    """ver.txt: 1〜3行が版、5行目がビルド番号。"""
+    lines = [line.strip() for line in raw_text.splitlines()]
+    if len(lines) < 5:
+        return None
+    major, minor, patch, build = lines[0], lines[1], lines[2], lines[4]
+    if not all((major, minor, patch, build)):
+        return None
+    return f"{major}.{minor}.{patch}B{build}"
+
+
+def _find_ver_txt_path(normalized_names: list[str]) -> Optional[str]:
+    for name in normalized_names:
+        lower = name.lower()
+        if lower == "viscotech/ver.txt" or lower.endswith("/viscotech/ver.txt"):
+            return name
+    return None
+
+
+def _format_zip_date_time(zi: zipfile.ZipInfo) -> str:
+    y, m, d, hh, mm, ss = zi.date_time
+    return f"{y:04d}-{m:02d}-{d:02d} {hh:02d}:{mm:02d}:{ss:02d}"
+
+
+def extract_task_zip_metadata(
+    task_file_path: str,
+    task_prefix: Optional[str] = None,
+) -> TaskZipMetadata:
+    """ver.txt と info.txt から TaskZipMetadata を組み立てる。"""
+    with zipfile.ZipFile(task_file_path, "r") as zip_ref:
+        raw_names = zip_ref.namelist()
+        normalized_names = [name.replace("\\", "/") for name in raw_names]
+        norm_to_raw = _normalized_to_raw_map(raw_names, normalized_names)
+
+        version: Optional[str] = None
+        last_from_zip: Optional[str] = None
+        ver_path = _find_ver_txt_path(normalized_names)
+        if ver_path:
+            raw_ver = read_zip_member(
+                zip_ref,
+                norm_to_raw.get(ver_path, ver_path),
+                max_bytes=MAX_ZIP_TEXT_BYTES,
+            ).decode("utf-8", errors="ignore")
+            version = parse_task_version_text(raw_ver)
+            try:
+                last_from_zip = _format_zip_date_time(
+                    zip_ref.getinfo(norm_to_raw.get(ver_path, ver_path))
+                )
+            except KeyError:
+                last_from_zip = None
+
+        title: Optional[str] = None
+        comment: Optional[str] = None
+        last_from_info: Optional[str] = None
+        if task_prefix:
+            info_path = _find_task_info_path(normalized_names, task_prefix)
+            if info_path:
+                raw_info = read_zip_member(
+                    zip_ref,
+                    norm_to_raw.get(info_path, info_path),
+                    max_bytes=MAX_ZIP_TEXT_BYTES,
+                ).decode("utf-8-sig", errors="ignore")
+                title, comment, last_from_info = parse_task_info_txt(raw_info)
+
+        last_updated = last_from_info or last_from_zip
+        return TaskZipMetadata(
+            version=version,
+            title=title,
+            comment=comment,
+            last_updated=last_updated,
+        )
+
+
 def extract_task_file(
     task_file_path: str,
     output_folder: str,
@@ -520,7 +641,7 @@ def extract_task_file(
         output_path = Path(output_folder)
 
         with zipfile.ZipFile(task_file_path, "r") as zip_ref:
-            zip_ref.extractall(output_folder)
+            safe_zip_extractall(zip_ref, output_folder)
 
         viscotech_folder_path = output_path / "viscotech"
         if task_prefix:

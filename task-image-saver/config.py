@@ -3,6 +3,7 @@
 """
 import os
 import json
+import sys
 from typing import Dict, Any
 from pathlib import Path
 
@@ -68,10 +69,35 @@ class ConfigManager:
         Args:
             config_file_name: 設定ファイル名
         """
-        script_dir = Path(__file__).parent.absolute()
-        self.config_file = script_dir / config_file_name
+        self.config_file = self._resolve_config_path(config_file_name)
         self._config: Dict[str, Any] = {}
         self.load()
+
+    @staticmethod
+    def _resolve_config_path(config_file_name: str) -> Path:
+        """
+        設定ファイルの保存場所を決める。
+
+        配布版 exe では exe と同じフォルダを優先する。
+        """
+        candidates: list[Path] = []
+        install = os.environ.get("TASK_IMAGE_SAVER_INSTALL_DIR", "").strip()
+        if install:
+            candidates.append(Path(install) / config_file_name)
+        exe = Path(sys.executable).resolve()
+        if exe.suffix.lower() == ".exe" and exe.name.lower() not in (
+            "python.exe",
+            "pythonw.exe",
+            "flet.exe",
+        ):
+            candidates.append(exe.parent / config_file_name)
+        candidates.append(Path(__file__).parent.absolute() / config_file_name)
+        for path in candidates:
+            if path.exists():
+                return path
+        if install:
+            return Path(install) / config_file_name
+        return candidates[0]
     
     def load(self) -> Dict[str, Any]:
         """
