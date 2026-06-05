@@ -91,6 +91,7 @@ class ConfigManager:
             "flet.exe",
         ):
             candidates.append(exe.parent / config_file_name)
+        candidates.append(Path(__file__).resolve().parent.parent / config_file_name)
         candidates.append(Path(__file__).parent.absolute() / config_file_name)
         for path in candidates:
             if path.exists():

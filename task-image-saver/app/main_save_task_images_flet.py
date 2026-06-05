@@ -127,7 +127,8 @@ def _prefer_built_flet_client() -> None:
     """開発時のみ: flet build windows の Dropzone 入り exe を優先する。"""
     if is_packaged_app():
         return
-    build_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build", "windows")
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    build_dir = os.path.join(project_root, "build", "windows")
     if not os.path.isdir(build_dir):
         return
     for name in ("TaskImageSaver.exe", "task-image-saver.exe"):

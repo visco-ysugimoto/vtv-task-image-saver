@@ -172,15 +172,15 @@ class TaskImageSaverApp:
         self.page.theme_mode = ft.ThemeMode.LIGHT
 
         icon_png = (
-            resolve_resource_path("icon_image.png")
-            or resolve_resource_path("icon.png")
+            resolve_resource_path("icon.png")
+            or resolve_resource_path("launcher.png")
         )
         if icon_png:
             self.page.window.icon = icon_png
 
         icon_ico = (
-            resolve_resource_path("icon_image.ico")
-            or resolve_resource_path("icon_windows.ico")
+            resolve_resource_path("icon_windows.ico")
+            or resolve_resource_path("launcher.ico")
         )
         set_window_icon_win32(self.page.title, icon_ico)
 

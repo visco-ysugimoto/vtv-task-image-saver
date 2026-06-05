@@ -38,8 +38,10 @@ def resolve_resource_path(filename: str) -> str | None:
     candidates.append(os.path.join(exe_dir, filename))
     candidates.append(os.path.join(exe_dir, "data", "flutter_assets", "assets", filename))
     _script_dir = os.path.dirname(os.path.abspath(__file__))
+    _project_root = os.path.dirname(_script_dir)
     candidates.append(os.path.join(_script_dir, filename))
     candidates.append(os.path.join(_script_dir, "assets", filename))
+    candidates.append(os.path.join(_project_root, "assets", filename))
     for p in candidates:
         if p and os.path.exists(p):
             return os.path.abspath(p)

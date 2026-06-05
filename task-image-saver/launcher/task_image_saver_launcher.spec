@@ -1,9 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
 # PyInstaller: 配布用 TaskImageSaver.exe ランチャー（Flet 非同梱）
 
+import os
+
+SPEC_DIR = os.path.dirname(os.path.abspath(SPEC))
+PROJECT_ROOT = os.path.normpath(os.path.join(SPEC_DIR, ".."))
+APP_DIR = os.path.join(PROJECT_ROOT, "app")
+ICON_PATH = os.path.join(PROJECT_ROOT, "assets", "launcher.ico")
+
 a = Analysis(
-    ["task_image_saver_launcher.py"],
-    pathex=[],
+    [os.path.join(SPEC_DIR, "task_image_saver_launcher.py")],
+    pathex=[APP_DIR],
     binaries=[],
     datas=[],
     hiddenimports=[],
@@ -35,5 +42,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon="icon_image.ico",
+    icon=ICON_PATH,
 )

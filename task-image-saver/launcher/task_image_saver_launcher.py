@@ -11,6 +11,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+_APP_DIR = Path(__file__).resolve().parent.parent / "app"
+if str(_APP_DIR) not in sys.path:
+    sys.path.insert(0, str(_APP_DIR))
+
 from launch_handoff import write_pending_launch
 from runtime_sync import (
     APP_EXE_NAME,
@@ -27,7 +31,7 @@ LAUNCH_FILE_ENV = "TASK_IMAGE_SAVER_LAUNCH_FILE"
 def _install_root() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+    return Path(__file__).resolve().parent.parent
 
 
 def _resolve_app_exe(install: Path) -> Path | None:

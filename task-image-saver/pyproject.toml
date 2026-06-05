@@ -18,15 +18,8 @@ company = "VISCO"
 copyright = "Copyright (C) VISCO"
 
 [tool.flet.app]
-path = "."
+path = "app"
 module = "main_save_task_images_flet"
 exclude = [
-    "build",
-    "dist",
     "__pycache__",
-    "*.spec",
-    "build_*.ps1",
-    "build_*.cmd",
-    "package_release.*",
-    "RELEASE_README.txt",
 ]

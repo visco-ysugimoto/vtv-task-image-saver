@@ -7,8 +7,17 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Get-RepoRoot {
+    if (Test-Path (Join-Path $PSScriptRoot "TaskImageSaver.exe")) {
+        return $PSScriptRoot
+    }
+    return Split-Path $PSScriptRoot -Parent
+}
+
 function Resolve-AppPath {
     param([string]$InputPath)
+
+    $repoRoot = Get-RepoRoot
 
     if ($InputPath) {
         if ([System.IO.Path]::IsPathRooted($InputPath)) {
@@ -22,22 +31,22 @@ function Resolve-AppPath {
         return (Resolve-Path $localExePath).Path
     }
 
-    $releasePath = Join-Path $PSScriptRoot "dist\TaskImageSaver\TaskImageSaver.exe"
+    $releasePath = Join-Path $repoRoot "dist\TaskImageSaver\TaskImageSaver.exe"
     if (Test-Path $releasePath) {
         return (Resolve-Path $releasePath).Path
     }
 
-    $buildPath = Join-Path $PSScriptRoot "build\windows\TaskImageSaver.exe"
+    $buildPath = Join-Path $repoRoot "build\windows\TaskImageSaver.exe"
     if (Test-Path $buildPath) {
         return (Resolve-Path $buildPath).Path
     }
 
-    $legacyBuild = Join-Path $PSScriptRoot "build\windows\task-image-saver.exe"
+    $legacyBuild = Join-Path $repoRoot "build\windows\task-image-saver.exe"
     if (Test-Path $legacyBuild) {
         return (Resolve-Path $legacyBuild).Path
     }
 
-    $defaultOneFilePath = Join-Path $PSScriptRoot "dist\TaskImageSaver.exe"
+    $defaultOneFilePath = Join-Path $repoRoot "dist\TaskImageSaver.exe"
     if (Test-Path $defaultOneFilePath) {
         return (Resolve-Path $defaultOneFilePath).Path
     }

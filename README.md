@@ -22,13 +22,13 @@ cd .\task-image-saver
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-python .\main_save_task_images_flet.py
+python .\app\main_save_task_images_flet.py
 ```
 
 ## 設定ファイル（共有VTVフォルダの保存）
 
 アプリは `共有VTVフォルダパス.json` に前回選択した共有フォルダを保存します（リポジトリには含めません）。
-必要なら `task-image-saver\共有VTVフォルダパス.sample.json` をコピーして利用してください。
+必要なら `task-image-saver\config\共有VTVフォルダパス.sample.json` をコピーして利用してください。
 
 ## 配布パッケージのビルド
 
@@ -40,7 +40,7 @@ cd .\task-image-saver
 または:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\package_release.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\package_release.ps1
 ```
 
 成果物:
@@ -54,13 +54,13 @@ powershell -ExecutionPolicy Bypass -File .\package_release.ps1
 
 ```powershell
 cd .\task-image-saver
-.\register_task_image_saver_context_menu.ps1
+.\deploy\register_task_image_saver_context_menu.ps1
 ```
 
 解除:
 
 ```powershell
-.\unregister_task_image_saver_context_menu.ps1
+.\deploy\unregister_task_image_saver_context_menu.ps1
 ```
 
 ## TaskFilePreviewer（別アプリ）

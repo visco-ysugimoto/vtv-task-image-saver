@@ -1,12 +1,12 @@
-# icon_image.* を Flet ビルド用 assets に同期する
+# assets/launcher.* を Flet ビルド用 assets に同期する
 $ErrorActionPreference = "Stop"
-Set-Location $PSScriptRoot
+$ProjectRoot = Split-Path $PSScriptRoot -Parent
 
-$assetsDir = Join-Path $PSScriptRoot "assets"
+$assetsDir = Join-Path $ProjectRoot "assets"
 New-Item -ItemType Directory -Path $assetsDir -Force | Out-Null
 
-$ico = Join-Path $PSScriptRoot "icon_image.ico"
-$png = Join-Path $PSScriptRoot "icon_image.png"
+$ico = Join-Path $assetsDir "launcher.ico"
+$png = Join-Path $assetsDir "launcher.png"
 if (-not (Test-Path $ico)) { throw "Missing icon: $ico" }
 if (-not (Test-Path $png)) { throw "Missing icon: $png" }
 

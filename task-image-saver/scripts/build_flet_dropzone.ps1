@@ -1,6 +1,7 @@
 # Dropzone 拡張入り Flet クライアントをビルドする（ドラッグ＆ドロップ用）
 $ErrorActionPreference = "Stop"
-Set-Location $PSScriptRoot
+$ProjectRoot = Split-Path $PSScriptRoot -Parent
+Set-Location $ProjectRoot
 
 $env:PYTHONUTF8 = "1"
 $env:FLET_CLI_NO_RICH_OUTPUT = "1"
@@ -15,8 +16,8 @@ if ($exe) {
     Write-Host ""
     Write-Host "起動方法 (どちらか):"
     Write-Host "  $($exe.FullName)"
-    Write-Host "  python .\main_save_task_images_flet.py"
+    Write-Host "  python .\app\main_save_task_images_flet.py"
 } else {
-    Write-Host "build\windows に exe が見つかりません。build_dropzone_log.txt を確認してください。"
+    Write-Host "build\windows に exe が見つかりません。"
     exit 1
 }

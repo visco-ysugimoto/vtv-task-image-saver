@@ -101,8 +101,18 @@ def sync_app_zip(app_zip: Path, src_dir: Path) -> int:
     return 0
 
 
+def project_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def app_source_dir() -> Path:
+    return project_root() / "app"
+
+
 if __name__ == "__main__":
-    base = Path(__file__).resolve().parent
-    default_zip = base / "build" / "windows" / "data" / "flutter_assets" / "app" / "app.zip"
+    root = project_root()
+    default_zip = (
+        root / "build" / "windows" / "data" / "flutter_assets" / "app" / "app.zip"
+    )
     target = Path(sys.argv[1]) if len(sys.argv) > 1 else default_zip
-    raise SystemExit(sync_app_zip(target, base))
+    raise SystemExit(sync_app_zip(target, app_source_dir()))

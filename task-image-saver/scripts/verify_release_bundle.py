@@ -42,6 +42,10 @@ def verify(app_dir: Path) -> int:
 
 
 if __name__ == "__main__":
-    base = Path(__file__).resolve().parent
-    target = Path(sys.argv[1]) if len(sys.argv) > 1 else base / "dist" / "TaskImageSaver" / "app"
+    root = Path(__file__).resolve().parent.parent
+    target = (
+        Path(sys.argv[1])
+        if len(sys.argv) > 1
+        else root / "dist" / "TaskImageSaver" / "app"
+    )
     raise SystemExit(verify(target))

@@ -4,13 +4,14 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-Set-Location $PSScriptRoot
+$ProjectRoot = Split-Path $PSScriptRoot -Parent
+Set-Location $ProjectRoot
 
 $env:PYTHONUTF8 = "1"
 $env:FLET_CLI_NO_RICH_OUTPUT = "1"
 
 function Get-ProjectVersion {
-    $toml = Get-Content "pyproject.toml" -Raw
+    $toml = Get-Content (Join-Path $ProjectRoot "pyproject.toml") -Raw
     if ($toml -match 'version\s*=\s*"([^"]+)"') {
         return $Matches[1]
     }
@@ -29,10 +30,12 @@ function Find-BuiltExe {
 }
 
 $version = Get-ProjectVersion
-$stageDir = Join-Path $PSScriptRoot "dist\TaskImageSaver"
+$stageDir = Join-Path $ProjectRoot "dist\TaskImageSaver"
 $appDir = Join-Path $stageDir "app"
-$zipPath = Join-Path $PSScriptRoot "dist\TaskImageSaver_v${version}_win64.zip"
-$buildOut = Join-Path $PSScriptRoot "build\windows"
+$zipPath = Join-Path $ProjectRoot "dist\TaskImageSaver_v${version}_win64.zip"
+$buildOut = Join-Path $ProjectRoot "build\windows"
+$deployDir = Join-Path $ProjectRoot "deploy"
+$configDir = Join-Path $ProjectRoot "config"
 
 Write-Host "=== TaskImageSaver release package (v$version) ===" -ForegroundColor Cyan
 
@@ -44,7 +47,7 @@ if (-not $SkipBuild) {
     Get-Process -Name "task-image-saver","TaskImageSaver","dart" -ErrorAction SilentlyContinue |
         Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 2
-    python -m pip install -r requirements.txt flet-cli -q
+    python -m pip install -r (Join-Path $ProjectRoot "requirements.txt") flet-cli -q
     if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
     python -m flet_cli.cli build windows --yes --no-rich-output
     if ($LASTEXITCODE -ne 0) { throw "flet build failed" }
@@ -97,14 +100,14 @@ if (Test-Path $mainExe) {
 Write-Host "Building TaskImageSaver launcher..." -ForegroundColor Yellow
 python -m pip install pyinstaller -q
 if ($LASTEXITCODE -ne 0) { throw "pip install pyinstaller failed" }
-$launcherDist = Join-Path $PSScriptRoot "build\launcher_dist"
-$launcherWork = Join-Path $PSScriptRoot "build\launcher_work"
+$launcherDist = Join-Path $ProjectRoot "build\launcher_dist"
+$launcherWork = Join-Path $ProjectRoot "build\launcher_work"
 if (Test-Path $launcherDist) { Remove-Item -Recurse -Force $launcherDist }
 if (Test-Path $launcherWork) { Remove-Item -Recurse -Force $launcherWork }
 python -m PyInstaller --clean --noconfirm `
     --distpath $launcherDist `
     --workpath $launcherWork `
-    task_image_saver_launcher.spec
+    (Join-Path $ProjectRoot "launcher\task_image_saver_launcher.spec")
 if ($LASTEXITCODE -ne 0) { throw "launcher build failed" }
 Copy-Item -Path (Join-Path $launcherDist "TaskImageSaver.exe") -Destination (Join-Path $stageDir "TaskImageSaver.exe") -Force
 Write-Host "Launcher installed as TaskImageSaver.exe" -ForegroundColor Green
@@ -114,13 +117,17 @@ $extraFiles = @(
     "register_task_image_saver_context_menu.ps1",
     "unregister_task_image_saver_context_menu.ps1"
 )
-$sampleConfig = Get-ChildItem -Path $PSScriptRoot -Filter "*sample.json" | Select-Object -First 1
+$sampleConfig = Get-ChildItem -Path $configDir -Filter "*sample.json" | Select-Object -First 1
 if ($sampleConfig) {
     $extraFiles += $sampleConfig.Name
 }
 
 foreach ($name in $extraFiles) {
-    $src = Join-Path $PSScriptRoot $name
+    if ($name -like "*sample.json") {
+        $src = Join-Path $configDir $name
+    } else {
+        $src = Join-Path $deployDir $name
+    }
     if (Test-Path $src) {
         Copy-Item -Path $src -Destination $stageDir -Force
     }
@@ -146,7 +153,7 @@ cd /d "%~dp0"
 "%~dp0TaskImageSaver.exe" %*
 '@ | Set-Content -Path (Join-Path $stageDir "TaskImageSaver.cmd") -Encoding ASCII
 
-Copy-Item -Path (Join-Path $PSScriptRoot "TaskImageSaver_launch.cmd") -Destination $stageDir -Force
+Copy-Item -Path (Join-Path $deployDir "TaskImageSaver_launch.cmd") -Destination $stageDir -Force
 
 @'
 @echo off
