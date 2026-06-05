@@ -7,12 +7,11 @@
 - `main_save_task_images_flet.py`: エントリポイント（Flet 起動）
 - `task_image_saver_ui.py`: Flet UI（画面・ダイアログ）
 - `task_image_saver_logic.py`: ビジネスロジック（画像処理フロー・プレビュー等）
+- `task_image_saver_launcher.py`: 配布用ランチャー
+- `runtime_sync.py`: 日本語パス向け runtime 同期（ハードリンク等）
 - `flet_resources.py`: リソースパス解決・ファイルダイアログ・Win32 アイコン
 - `flet_ui_constants.py`: UI 表示用テキスト定数
-- `main_save_task_images.py`: 旧Tk版
-- `main_save_task_images_flet.spec`: Fletフォルダ版ビルド
-- `main_save_task_images_flet_onefile.spec`: Flet単一exe版ビルド
-- `build_exe.ps1`: ビルドスクリプト
+- `build_exe.ps1` / `package_release.ps1`: 配布ビルド
 - `config.py` / `utils.py`: 設定・ZIP/タスクファイル共通処理
 - `save_task_images_CamNum_selection.py`: 画像コピー・CAM 選択のコア処理
 
@@ -37,7 +36,7 @@ package_release.cmd
 | 出力 | 内容 |
 |------|------|
 | `dist\TaskImageSaver\` | 配布フォルダ（このフォルダごとコピー） |
-| `dist\TaskImageSaver_v1.0.0_win64.zip` | 上記を ZIP 化したもの |
+| `dist\TaskImageSaver_v*_win64.zip` | 上記を ZIP 化したもの |
 
 利用者向け説明は `RELEASE_README.txt`（配布フォルダ内では `README.txt`）を同梱します。
 
@@ -104,7 +103,3 @@ python .\main_save_task_images_flet.py "C:\path\to\task.ziq"
 ```
 
 配布フォルダ内では `register_task_image_saver_context_menu.cmd` でも登録できます。
-
-## 旧 PyInstaller ビルド
-
-`main_save_task_images_flet.spec` は旧方式です。配布は上記 **package_release** を使用してください。

@@ -23,18 +23,10 @@ module = "main_save_task_images_flet"
 exclude = [
     "build",
     "dist",
-    "backup_*",
     "__pycache__",
     "*.spec",
-    "theme",
-    "azure.tcl",
     "build_*.ps1",
     "build_*.cmd",
     "package_release.*",
-    "build_dropzone_log*.txt",
     "RELEASE_README.txt",
-    "main_save_task_images.py",
-    "main_save_task_images_nocompress.py",
-    "selection_window.py",
-    "dynamic_gui_CamNum_selection.py",
 ]
