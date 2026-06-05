@@ -5,6 +5,10 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+_APP_DIR = Path(__file__).resolve().parent.parent / "app"
+if str(_APP_DIR) not in sys.path:
+    sys.path.insert(0, str(_APP_DIR))
+
 from security_limits import write_file_sha256
 
 
