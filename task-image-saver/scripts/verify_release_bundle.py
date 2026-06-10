@@ -7,7 +7,7 @@ import sys
 import zipfile
 from pathlib import Path
 
-from sync_python_app_zip import app_zip_hash_path, verify_app_zip_hash
+from sync_python_app_zip import APP_PY_FILES, app_zip_hash_path, verify_app_zip_hash
 
 
 def verify(app_dir: Path) -> int:
@@ -27,7 +27,18 @@ def verify(app_dir: Path) -> int:
     print(f"hash match  : {digest == hash_text}")
 
     with zipfile.ZipFile(app_zip) as zf:
+        zip_names = set(zf.namelist())
         ui = zf.read("task_image_saver_ui.py").decode("utf-8")
+    zip_module_checks = {
+        f"app.zip/{name}": name in zip_names for name in APP_PY_FILES
+    }
+    icon_checks = {
+        "app/assets/icon_windows.ico": (app_dir / "assets" / "icon_windows.ico").is_file(),
+        "stage assets/icon_windows.ico": (
+            app_dir.parent / "assets" / "icon_windows.ico"
+        ).is_file(),
+    }
+
     markers = {
         "no sidebar drop box": "_build_drop_target" not in ui,
         "full-page dropzone": "wrap_with_task_file_dropzone(" in ui,
@@ -35,8 +46,17 @@ def verify(app_dir: Path) -> int:
     }
     for name, ok in markers.items():
         print(f"ui marker [{name}]: {'OK' if ok else 'FAIL'}")
+    for name, ok in icon_checks.items():
+        print(f"icon [{name}]: {'OK' if ok else 'FAIL'}")
+    for name, ok in zip_module_checks.items():
+        print(f"module [{name}]: {'OK' if ok else 'FAIL'}")
 
-    ok = verify_app_zip_hash(app_zip) and all(markers.values())
+    ok = (
+        verify_app_zip_hash(app_zip)
+        and all(markers.values())
+        and all(icon_checks.values())
+        and all(zip_module_checks.values())
+    )
     print("RESULT:", "OK" if ok else "FAIL")
     return 0 if ok else 1
 

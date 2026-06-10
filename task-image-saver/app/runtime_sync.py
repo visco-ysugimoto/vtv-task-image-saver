@@ -1,13 +1,14 @@
 """日本語パス対策: app フォルダを ASCII の runtime へ高速同期する。"""
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-APP_VERSION = "1.0.19"
+APP_VERSION = "1.0.22"
 APP_EXE_NAME = "TaskImageSaverApp.exe"
 RUNTIME_APP_DIRNAME = "app"
 _SYNC_IGNORE_NAMES = frozenset({".app_version", "startup.log"})
@@ -81,12 +82,31 @@ def _has_legacy_flat_runtime(runtime_root: Path) -> bool:
     return False
 
 
+def _app_zip_digest(app_dir: Path) -> str:
+    """app.zip の sha256（app.zip.hash があればそれを優先）。"""
+    hash_path = app_dir / "data" / "flutter_assets" / "app" / "app.zip.hash"
+    if hash_path.is_file():
+        digest = hash_path.read_text(encoding="utf-8").strip()
+        if digest:
+            return digest
+    app_zip = app_dir / "data" / "flutter_assets" / "app" / "app.zip"
+    if not app_zip.is_file():
+        return ""
+    return hashlib.sha256(app_zip.read_bytes()).hexdigest()
+
+
 def needs_app_resync(source_app: Path, dest_app: Path) -> bool:
     if not dest_app.is_dir():
         return True
     dest_exe = _resolve_app_exe(dest_app)
     if dest_exe is None:
         return True
+
+    src_digest = _app_zip_digest(source_app)
+    dest_digest = _app_zip_digest(dest_app)
+    if src_digest and src_digest != dest_digest:
+        return True
+
     version_file = dest_app / ".app_version"
     if not version_file.is_file():
         return True

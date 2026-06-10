@@ -32,6 +32,9 @@ from flet_ui_constants import (
     PREVIEW_LIMIT_ROW_BOTTOM_GAP,
     PREVIEW_LIMIT_ROW_HEIGHT,
     PREVIEW_LIMIT_TEXT_SIZE,
+    SIDEBAR_COLLAPSED_STORAGE_KEY,
+    SIDEBAR_WIDTH_COLLAPSED,
+    SIDEBAR_WIDTH_EXPANDED,
 )
 from task_image_saver_logic import (
     TemplatePreviewSamples,
@@ -95,6 +98,7 @@ class TaskImageSaverApp:
             launch_task_file if launch_task_file and is_task_file_path(launch_task_file)
             else None
         )
+        self._sidebar_expanded = True
 
         self._init_refs()
         self._setup_page()
@@ -115,6 +119,8 @@ class TaskImageSaverApp:
         self.option2_save_mode_radio = ft.Ref[ft.RadioGroup]()
         self.option2_task_selection_column = ft.Ref[ft.Column]()
         self.option2_save_selection_info = ft.Ref[ft.Text]()
+        self.option2_select_all_btn = ft.Ref[ft.TextButton]()
+        self.option2_deselect_all_btn = ft.Ref[ft.TextButton]()
         self.group_num_field = ft.Ref[ft.TextField]()
         self.task_num_field = ft.Ref[ft.TextField]()
         self.option3_folder_field = ft.Ref[ft.TextField]()
@@ -127,6 +133,9 @@ class TaskImageSaverApp:
         self.preview_limit_value_text = ft.Ref[ft.Text]()
         self.option2_workspace = ft.Ref[ft.Container]()
         self.import_source_section = ft.Ref[ft.Container]()
+        self.sidebar_container = ft.Ref[ft.Container]()
+        self.sidebar_content = ft.Ref[ft.Container]()
+        self.sidebar_toggle = ft.Ref[ft.IconButton]()
 
         # 設定ダイアログ用
         self.save_mode_ref = ft.Ref[ft.RadioGroup]()
@@ -188,6 +197,51 @@ class TaskImageSaverApp:
             color_scheme_seed=ft.Colors.BLUE,
             font_family="Yu Gothic UI",
         )
+        self._load_sidebar_state()
+
+    def _load_sidebar_state(self) -> None:
+        """前回セッションのサイドバー折りたたみ状態を復元する。"""
+        try:
+            collapsed = self.page.client_storage.get(SIDEBAR_COLLAPSED_STORAGE_KEY)
+            if collapsed is not None:
+                self._sidebar_expanded = not bool(collapsed)
+        except Exception:
+            pass
+
+    def _save_sidebar_state(self) -> None:
+        try:
+            self.page.client_storage.set(
+                SIDEBAR_COLLAPSED_STORAGE_KEY,
+                not self._sidebar_expanded,
+            )
+        except Exception:
+            pass
+
+    def _toggle_sidebar(self, _e) -> None:
+        self._sidebar_expanded = not self._sidebar_expanded
+        self._apply_sidebar_state()
+        self._save_sidebar_state()
+
+    def _apply_sidebar_state(self) -> None:
+        expanded = self._sidebar_expanded
+        sidebar = self.sidebar_container.current
+        content = self.sidebar_content.current
+        toggle = self.sidebar_toggle.current
+        if sidebar is not None:
+            sidebar.width = SIDEBAR_WIDTH_EXPANDED if expanded else SIDEBAR_WIDTH_COLLAPSED
+            sidebar.padding = (
+                ft.Padding(left=15, right=15, top=15, bottom=15)
+                if expanded
+                else ft.Padding(left=0, right=0, top=8, bottom=8)
+            )
+        if content is not None:
+            content.visible = expanded
+        if toggle is not None:
+            toggle.icon = ft.Icons.CHEVRON_LEFT if expanded else ft.Icons.CHEVRON_RIGHT
+            toggle.tooltip = (
+                "サイドバーを折りたたむ" if expanded else "サイドバーを表示"
+            )
+        self.page.update()
 
     # ==================================================================
     # ダイアログ共通ヘルパー
@@ -533,6 +587,15 @@ class TaskImageSaverApp:
 
         selection_column.controls.clear()
         folders = self._option2_task_folders
+        save_mode = self._option2_save_mode()
+        selection_enabled = save_mode == "selected"
+        select_all_btn = self.option2_select_all_btn.current
+        deselect_all_btn = self.option2_deselect_all_btn.current
+        if select_all_btn is not None:
+            select_all_btn.disabled = not selection_enabled
+        if deselect_all_btn is not None:
+            deselect_all_btn.disabled = not selection_enabled
+
         if not folders:
             selection_column.controls.append(
                 ft.Text("タスクファイルを選択してください。",
@@ -542,8 +605,7 @@ class TaskImageSaverApp:
                 info_control.value = ""
             return
 
-        save_mode = self._option2_save_mode()
-        if len(folders) > 1 and save_mode != "selected":
+        if len(folders) > 1 and not selection_enabled:
             selection_column.controls.append(
                 ft.Text("全タスク保存中です。行クリックでサムネイルを確認できます。",
                         size=11, color=ft.Colors.GREY_600)
@@ -629,10 +691,13 @@ class TaskImageSaverApp:
             )
 
         if info_control:
-            selected_count = len(self._selected_option2_save_task_folders())
             total_count = len(folders)
-            info_control.value = (
-                f"保存対象: {selected_count} / {total_count} タスク")
+            if selection_enabled:
+                selected_count = len(self._option2_save_task_prefixes)
+                info_control.value = (
+                    f"保存対象: {selected_count} / {total_count} タスク")
+            else:
+                info_control.value = f"保存対象: 全 {total_count} タスク"
 
     def _select_option2_task_folder(self, folder):
         self.page.run_task(self._load_option2_task_preview, folder.prefix)
@@ -660,6 +725,8 @@ class TaskImageSaverApp:
             self._select_option2_task_folder(folder)
 
     def _set_option2_group_task_checked(self, checked: bool):
+        if self._option2_save_mode() != "selected":
+            return
         for folder in self._option2_task_folders:
             if checked:
                 self._option2_save_task_prefixes.add(folder.prefix)
@@ -1126,6 +1193,7 @@ class TaskImageSaverApp:
         elif option == "option2":
             self.dynamic_content.current.controls.extend(
                 self._build_option2_fields())
+            self._update_option2_save_task_controls()
         elif option == "option3":
             self.dynamic_content.current.controls.extend(
                 self._build_option3_fields())
@@ -1328,30 +1396,41 @@ class TaskImageSaverApp:
                                     weight=ft.FontWeight.W_500,
                                 ),
                                 *self._build_preview_limit_row(),
-                                ft.RadioGroup(
-                                    ref=self.option2_save_mode_radio,
-                                    value="all",
-                                    on_change=self._on_option2_save_mode_changed,
-                                    content=ft.Row([
-                                        ft.Radio(
-                                            value="all",
-                                            label="全タスク",
-                                        ),
-                                        ft.Radio(
-                                            value="selected",
-                                            label="選択のみ",
-                                        ),
-                                    ], spacing=0),
+                                ft.Container(
+                                    height=26,
+                                    content=ft.RadioGroup(
+                                        ref=self.option2_save_mode_radio,
+                                        value="all",
+                                        on_change=self._on_option2_save_mode_changed,
+                                        content=ft.Row([
+                                            ft.Radio(
+                                                value="all",
+                                                label="全タスク",
+                                                label_style=ft.TextStyle(size=11),
+                                                visual_density=ft.VisualDensity.COMPACT,
+                                            ),
+                                            ft.Radio(
+                                                value="selected",
+                                                label="選択のみ",
+                                                label_style=ft.TextStyle(size=11),
+                                                visual_density=ft.VisualDensity.COMPACT,
+                                            ),
+                                        ], spacing=4, tight=True),
+                                    ),
                                 ),
                                 ft.Row([
                                     ft.TextButton(
                                         "全選択",
+                                        ref=self.option2_select_all_btn,
+                                        disabled=True,
                                         style=ft.ButtonStyle(
                                             padding=ft.Padding.all(4)),
                                         on_click=lambda e:
                                             self._set_option2_group_task_checked(True)),
                                     ft.TextButton(
                                         "全解除",
+                                        ref=self.option2_deselect_all_btn,
+                                        disabled=True,
                                         style=ft.ButtonStyle(
                                             padding=ft.Padding.all(4)),
                                         on_click=lambda e:
@@ -1812,7 +1891,7 @@ class TaskImageSaverApp:
                     ),
                     ft.Container(height=8),
 
-                    ft.Text("圧縮率を選択 (100は元画像(bmp)で保存)",
+                    ft.Text("画質を選択 (100は元画像(bmp)で保存)",
                             size=13, weight=ft.FontWeight.W_500),
                     ft.Container(
                         bgcolor=ft.Colors.GREY_50, padding=10, border_radius=8,
@@ -2396,6 +2475,7 @@ class TaskImageSaverApp:
     # ==================================================================
 
     def _build_sidebar(self):
+        expanded = self._sidebar_expanded
         sidebar_controls = [
             ft.Text("タスク画像保存フロー", size=18, weight=ft.FontWeight.BOLD),
             ft.Divider(),
@@ -2421,13 +2501,54 @@ class TaskImageSaverApp:
                         ft.Text(f"※ {hint}", size=10, color=ft.Colors.GREY_600),
                     )
         return ft.Container(
-            width=220,
+            ref=self.sidebar_container,
+            width=SIDEBAR_WIDTH_EXPANDED if expanded else SIDEBAR_WIDTH_COLLAPSED,
             bgcolor=ft.Colors.GREY_100,
-            padding=15,
+            padding=(
+                ft.Padding(left=15, right=15, top=15, bottom=15)
+                if expanded
+                else ft.Padding(left=0, right=0, top=8, bottom=8)
+            ),
             alignment=ft.Alignment(-1, -1),
             content=ft.Column(
-                sidebar_controls,
-                scroll=ft.ScrollMode.AUTO,
+                [
+                    ft.Row(
+                        [
+                            ft.IconButton(
+                                ref=self.sidebar_toggle,
+                                icon=(
+                                    ft.Icons.CHEVRON_LEFT
+                                    if expanded
+                                    else ft.Icons.CHEVRON_RIGHT
+                                ),
+                                tooltip=(
+                                    "サイドバーを折りたたむ"
+                                    if expanded
+                                    else "サイドバーを表示"
+                                ),
+                                on_click=self._toggle_sidebar,
+                                icon_size=20,
+                                style=ft.ButtonStyle(padding=0),
+                            ),
+                        ],
+                        alignment=(
+                            ft.MainAxisAlignment.END
+                            if expanded
+                            else ft.MainAxisAlignment.CENTER
+                        ),
+                    ),
+                    ft.Container(
+                        ref=self.sidebar_content,
+                        visible=expanded,
+                        expand=True,
+                        content=ft.Column(
+                            sidebar_controls,
+                            scroll=ft.ScrollMode.AUTO,
+                            alignment=ft.MainAxisAlignment.START,
+                        ),
+                    ),
+                ],
+                expand=True,
                 alignment=ft.MainAxisAlignment.START,
             ),
         )

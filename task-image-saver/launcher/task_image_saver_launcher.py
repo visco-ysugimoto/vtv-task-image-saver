@@ -7,6 +7,7 @@ TaskImageSaver.exe から起動し、パスに非 ASCII がある場合は
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -101,6 +102,32 @@ def _find_or_create_subst_drive(install: Path) -> str | None:
     return None
 
 
+def _refresh_flet_cache_if_needed(install: Path) -> None:
+    """app.zip 更新時に Roaming の Flet 増分キャッシュ不整合を防ぐ。"""
+    if sys.platform != "win32":
+        return
+    appdata = os.environ.get("APPDATA", "").strip()
+    if not appdata:
+        return
+    hash_path = (
+        install / "app" / "data" / "flutter_assets" / "app" / "app.zip.hash"
+    )
+    if not hash_path.is_file():
+        return
+    expected = hash_path.read_text(encoding="utf-8").strip()
+    if not expected:
+        return
+    state_dir = Path(appdata) / "VISCO" / "TaskImageSaver"
+    marker = state_dir / "flet_app_zip.hash"
+    if marker.is_file() and marker.read_text(encoding="utf-8").strip() == expected:
+        return
+    cache = state_dir / "flet"
+    if cache.exists():
+        shutil.rmtree(cache)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    marker.write_text(expected, encoding="utf-8")
+
+
 def _apply_launch_args_to_env(env: dict[str, str], args: list[str]) -> None:
     """右クリック等の引数を環境変数へ渡す（Flet 同梱 exe は sys.argv を受け取れない場合がある）。"""
     for raw in args:
@@ -133,6 +160,7 @@ def _replace_with_app(exe: Path, cwd: Path, install_dir: Path, args: list[str]) 
 
 def main() -> int:
     install = _install_root()
+    _refresh_flet_cache_if_needed(install)
     app_exe = _resolve_app_exe(install)
     if app_exe is None:
         _show_error(

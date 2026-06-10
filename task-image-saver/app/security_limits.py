@@ -122,6 +122,66 @@ def read_zip_member(
         return read_stream_bounded(member_stream, max_bytes)
 
 
+def _normalize_prefix_set(prefixes: list[str]) -> set[str]:
+    return {
+        _normalize_zip_member_path(prefix).rstrip("/")
+        for prefix in prefixes
+        if prefix and prefix.strip()
+    }
+
+
+def zip_member_matches_prefixes(normalized_name: str, prefixes: set[str]) -> bool:
+    """ZIP メンバーが指定プレフィックス配下か判定する。"""
+    if not prefixes:
+        return True
+    normalized = _normalize_zip_member_path(normalized_name).rstrip("/")
+    if not normalized:
+        return False
+    for prefix in prefixes:
+        if normalized == prefix or normalized.startswith(f"{prefix}/"):
+            return True
+    return False
+
+
+def _extract_zip_member(
+    zip_ref: zipfile.ZipFile,
+    info: zipfile.ZipInfo,
+    dest: Path,
+    *,
+    max_member_bytes: int,
+) -> None:
+    normalized = _normalize_zip_member_path(info.filename)
+    is_directory = normalized.endswith("/") or info.is_dir()
+
+    if not is_directory:
+        check_zip_member_size(info, max_member_bytes)
+
+    rel = PurePosixPath(normalized.rstrip("/"))
+    if not rel.parts:
+        return
+    target = (dest / Path(*rel.parts)).resolve()
+
+    if is_directory:
+        target.mkdir(parents=True, exist_ok=True)
+        return
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with zip_ref.open(info) as src, open(target, "wb") as dst:
+        remaining = max_member_bytes
+        block = 1024 * 1024
+        while True:
+            chunk = src.read(min(block, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            if remaining < 0:
+                raise ZipMemberSizeError(
+                    f"展開中に上限を超えました: {info.filename} "
+                    f"(>{max_member_bytes} bytes)"
+                )
+            dst.write(chunk)
+
+
 def safe_zip_extractall(
     zip_ref: zipfile.ZipFile,
     output_folder: str | Path,
@@ -137,37 +197,40 @@ def safe_zip_extractall(
             raise ZipPathSecurityError(
                 f"安全でないZIPパスです: {info.filename}"
             )
+        _extract_zip_member(
+            zip_ref, info, dest, max_member_bytes=max_member_bytes,
+        )
 
+
+def safe_zip_extract_prefixes(
+    zip_ref: zipfile.ZipFile,
+    output_folder: str | Path,
+    prefixes: list[str],
+    *,
+    max_member_bytes: int = MAX_IMAGE_BYTES,
+) -> None:
+    """指定プレフィックス配下の ZIP メンバーのみ、安全チェック付きで展開する。"""
+    prefix_set = _normalize_prefix_set(prefixes)
+    if not prefix_set:
+        safe_zip_extractall(
+            zip_ref, output_folder, max_member_bytes=max_member_bytes,
+        )
+        return
+
+    dest = Path(output_folder).resolve()
+    dest.mkdir(parents=True, exist_ok=True)
+
+    for info in zip_ref.infolist():
+        if not is_safe_zip_member_path(info.filename, dest):
+            raise ZipPathSecurityError(
+                f"安全でないZIPパスです: {info.filename}"
+            )
         normalized = _normalize_zip_member_path(info.filename)
-        is_directory = normalized.endswith("/") or info.is_dir()
-
-        if not is_directory:
-            check_zip_member_size(info, max_member_bytes)
-
-        rel = PurePosixPath(normalized.rstrip("/"))
-        if not rel.parts:
+        if not zip_member_matches_prefixes(normalized, prefix_set):
             continue
-        target = (dest / Path(*rel.parts)).resolve()
-
-        if is_directory:
-            target.mkdir(parents=True, exist_ok=True)
-            continue
-
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with zip_ref.open(info) as src, open(target, "wb") as dst:
-            remaining = max_member_bytes
-            block = 1024 * 1024
-            while True:
-                chunk = src.read(min(block, remaining))
-                if not chunk:
-                    break
-                remaining -= len(chunk)
-                if remaining < 0:
-                    raise ZipMemberSizeError(
-                        f"展開中に上限を超えました: {info.filename} "
-                        f"(>{max_member_bytes} bytes)"
-                    )
-                dst.write(chunk)
+        _extract_zip_member(
+            zip_ref, info, dest, max_member_bytes=max_member_bytes,
+        )
 
 
 def validate_decoded_image_size(

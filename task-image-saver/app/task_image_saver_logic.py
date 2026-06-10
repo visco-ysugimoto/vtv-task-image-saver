@@ -6,6 +6,7 @@ from __future__ import annotations
 import io
 import os
 import re
+import shutil
 import tempfile
 import traceback
 import zipfile
@@ -200,34 +201,11 @@ def cleanup_extracted_task_folders(
         if not cleanup_path or not os.path.isdir(cleanup_path):
             continue
         try:
-            entries = []
-            for walk_root, dirs, files in os.walk(cleanup_path, topdown=False):
-                for file_name in files:
-                    entries.append(os.path.join(walk_root, file_name))
-                for dir_name in dirs:
-                    entries.append(os.path.join(walk_root, dir_name))
-            entries.append(cleanup_path)
-
-            total = len(entries)
             if on_progress:
-                on_progress(0, total, "展開フォルダを削除中...")
-
-            for index, entry_path in enumerate(entries, 1):
-                if os.path.isfile(entry_path) or os.path.islink(entry_path):
-                    os.unlink(entry_path)
-                elif os.path.isdir(entry_path):
-                    os.rmdir(entry_path)
-
-                rel_path = os.path.relpath(entry_path, cleanup_path)
-                if on_progress:
-                    on_progress(
-                        index,
-                        total,
-                        f"展開フォルダ削除中:\n{rel_path}",
-                    )
-
+                on_progress(0, 1, "作業フォルダを削除中...")
+            shutil.rmtree(cleanup_path)
             if on_progress:
-                on_progress(total, total, "展開フォルダ削除完了")
+                on_progress(1, 1, "作業フォルダ削除完了")
             print(f"展開フォルダを削除しました: {cleanup_path}")
         except Exception as ex:
             print(f"展開フォルダの削除に失敗しました: {cleanup_path} - {ex}")
@@ -363,10 +341,6 @@ def prepare_option2_extraction(
 
         multi_task = len(folders) > 1
         if multi_task:
-            extract_task_file(task_file, output_folder)
-            result["cleanup_paths"] = [
-                os.path.join(output_folder, "viscotech"),
-            ]
             target_folders = folders
             if save_target_mode == "selected":
                 target_folders = [
@@ -377,6 +351,14 @@ def prepare_option2_extraction(
                 result["error"] = "保存対象タスクを選択してください。"
                 return result
 
+            extract_task_file(
+                task_file,
+                output_folder,
+                task_prefixes=[folder.prefix for folder in target_folders],
+            )
+            result["cleanup_paths"] = [
+                os.path.join(output_folder, "viscotech"),
+            ]
             task_save_jobs = []
             for folder in target_folders:
                 img_path = os.path.join(

@@ -3,6 +3,17 @@ import os
 import shutil
 import re
 
+AUTO_SAVED_COMMENT = 'この画像は自動で保存されました。'
+
+
+def normalize_comment(comment):
+    """リネーム用にコメントを正規化。自動保存コメントは空と同等。"""
+    if not comment:
+        return ''
+    if comment == AUTO_SAVED_COMMENT:
+        return ''
+    return str(comment)
+
 
 def sanitize_filename(filename):
     """
@@ -131,9 +142,7 @@ def should_save_file(save_mode, img_info_dict):
     """画像ファイルを保存するかどうかを判定"""
     if save_mode == '0':
         return True
-    if (save_mode == '1'
-            and img_info_dict.get('comment')
-            and img_info_dict['comment'] != 'この画像は自動で保存されました。'):
+    if save_mode == '1' and normalize_comment(img_info_dict.get('comment')):
         return True
     if save_mode == '2' and img_info_dict.get('lockMode') == '1':
         return True
@@ -169,7 +178,7 @@ def generate_new_file_name(img_info_dict, file_name, index, tool_comment,
                            cam, div, filename_templates,
                            is_duplicate_comment=False):
     """テンプレートを使用してファイル名を生成"""
-    comment = img_info_dict.get('comment', '')
+    comment = normalize_comment(img_info_dict.get('comment', ''))
     original_name = os.path.splitext(file_name)[0]
     file_source = img_info_dict.get('fileName', '')
 
@@ -420,7 +429,7 @@ def process_images(folder_path, output_folder, save_mode, save_cam,
         process_file(file_path, img_info_dict, file_name_list)
         img_info_dict['fileNameList'] = file_name_list
 
-        comment = img_info_dict.get('comment', '')
+        comment = normalize_comment(img_info_dict.get('comment', ''))
         current_source = img_info_dict.get('fileName', '')
         is_duplicate_comment = False
         if comment:

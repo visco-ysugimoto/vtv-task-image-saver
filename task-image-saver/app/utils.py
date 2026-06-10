@@ -13,6 +13,7 @@ from security_limits import (
     MAX_ZIP_TEXT_BYTES,
     open_image_file,
     read_zip_member,
+    safe_zip_extract_prefixes,
     safe_zip_extractall,
 )
 
@@ -622,6 +623,7 @@ def extract_task_file(
     task_file_path: str,
     output_folder: str,
     task_prefix: Optional[str] = None,
+    task_prefixes: Optional[list[str]] = None,
 ) -> Optional[str]:
     """
     タスクファイルを解凍し、選択タスクの img フォルダのパスを返す。
@@ -630,6 +632,7 @@ def extract_task_file(
         task_file_path: タスクファイルのパス
         output_folder: 解凍先フォルダ
         task_prefix: viscotech/task/gXX/<task>。None の場合は最初の img を返す。
+        task_prefixes: 展開するタスク prefix の一覧。指定時は該当メンバーのみ展開。
 
     Returns:
         imgフォルダのパス（見つからない場合はNone）
@@ -638,7 +641,16 @@ def extract_task_file(
         output_path = Path(output_folder)
 
         with zipfile.ZipFile(task_file_path, "r") as zip_ref:
-            safe_zip_extractall(zip_ref, output_folder)
+            if task_prefixes:
+                safe_zip_extract_prefixes(
+                    zip_ref, output_folder, task_prefixes,
+                )
+            elif task_prefix:
+                safe_zip_extract_prefixes(
+                    zip_ref, output_folder, [task_prefix],
+                )
+            else:
+                safe_zip_extractall(zip_ref, output_folder)
 
         viscotech_folder_path = output_path / "viscotech"
         if task_prefix:

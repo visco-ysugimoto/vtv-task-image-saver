@@ -82,6 +82,20 @@ New-Item -ItemType Directory -Path $appDir -Force | Out-Null
 Write-Host "Copying to dist\TaskImageSaver..." -ForegroundColor Yellow
 Copy-Item -Path (Join-Path $buildOut "*") -Destination $appDir -Recurse -Force
 
+$iconFiles = @("launcher.ico", "icon_windows.ico", "icon.png", "launcher.png")
+$assetsSrc = Join-Path $ProjectRoot "assets"
+$stageAssets = Join-Path $stageDir "assets"
+$appStageAssets = Join-Path $appDir "assets"
+New-Item -ItemType Directory -Path $stageAssets -Force | Out-Null
+New-Item -ItemType Directory -Path $appStageAssets -Force | Out-Null
+foreach ($name in $iconFiles) {
+    $src = Join-Path $assetsSrc $name
+    if (Test-Path $src) {
+        Copy-Item -Path $src -Destination $stageAssets -Force
+        Copy-Item -Path $src -Destination $appStageAssets -Force
+    }
+}
+
 $stageExe = Find-BuiltExe -Dir $appDir
 if ($stageExe -and (Split-Path $stageExe -Leaf) -ne "TaskImageSaver.exe") {
     Move-Item -Force $stageExe (Join-Path $appDir "TaskImageSaver.exe")

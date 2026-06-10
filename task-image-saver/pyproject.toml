@@ -1,6 +1,6 @@
 [project]
 name = "task-image-saver"
-version = "1.0.19"
+version = "1.0.22"
 description = "VTVタスク画像保存 (Flet)"
 requires-python = ">=3.10"
 dependencies = [

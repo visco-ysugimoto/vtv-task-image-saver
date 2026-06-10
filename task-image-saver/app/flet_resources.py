@@ -36,12 +36,21 @@ def resolve_resource_path(filename: str) -> str | None:
     exe_dir = os.path.dirname(sys.executable)
     candidates.append(os.path.join(exe_dir, "_internal", filename))
     candidates.append(os.path.join(exe_dir, filename))
+    candidates.append(os.path.join(exe_dir, "assets", filename))
     candidates.append(os.path.join(exe_dir, "data", "flutter_assets", "assets", filename))
+    install_dir = os.environ.get("TASK_IMAGE_SAVER_INSTALL_DIR", "").strip()
+    if install_dir:
+        candidates.append(os.path.join(install_dir, "assets", filename))
+        candidates.append(os.path.join(install_dir, "app", "assets", filename))
+    parent_dir = os.path.dirname(exe_dir)
+    if parent_dir and parent_dir != exe_dir:
+        candidates.append(os.path.join(parent_dir, "assets", filename))
     _script_dir = os.path.dirname(os.path.abspath(__file__))
     _project_root = os.path.dirname(_script_dir)
     candidates.append(os.path.join(_script_dir, filename))
     candidates.append(os.path.join(_script_dir, "assets", filename))
     candidates.append(os.path.join(_project_root, "assets", filename))
+    candidates.append(os.path.join(os.path.dirname(_project_root), "assets", filename))
     for p in candidates:
         if p and os.path.exists(p):
             return os.path.abspath(p)

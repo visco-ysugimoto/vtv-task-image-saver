@@ -10,6 +10,10 @@ UI: task_image_saver_ui
 """
 from __future__ import annotations
 
+from launch_handoff import ensure_flet_app_cache_complete
+
+ensure_flet_app_cache_complete()
+
 from app_runtime import ensure_ascii_runtime_exit, is_packaged_app, setup_runtime
 
 ensure_ascii_runtime_exit()

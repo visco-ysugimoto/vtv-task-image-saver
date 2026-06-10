@@ -98,6 +98,12 @@ def sync_app_zip(app_zip: Path, src_dir: Path) -> int:
     if not verify_app_zip_hash(app_zip):
         print("ERROR: app.zip.hash verification failed", file=sys.stderr)
         return 1
+    with zipfile.ZipFile(app_zip) as zf:
+        names = set(zf.namelist())
+    missing = [name for name in APP_PY_FILES if name not in names]
+    if missing:
+        print(f"ERROR: app.zip missing modules: {', '.join(missing)}", file=sys.stderr)
+        return 1
     return 0
 
 
