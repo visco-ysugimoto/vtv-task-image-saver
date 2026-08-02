@@ -5,6 +5,7 @@ import os
 import re
 import zipfile
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Callable
 from PIL import Image
@@ -182,6 +183,322 @@ def discover_task_folders(normalized_names: list[str]) -> list[TaskFolder]:
         task = match.group(3)
         folders.setdefault(prefix, TaskFolder(prefix=prefix, label=f"{group}/{task}"))
     return sorted(folders.values(), key=lambda folder: _task_folder_sort_key(folder.label))
+
+
+FILESYSTEM_GROUP_DIR_RE = re.compile(r"^g\d+$", re.IGNORECASE)
+
+
+def find_task_info_path_on_disk(task_dir: str) -> Optional[str]:
+    """タスクフォルダ配下の info.txt を探す（大文字小文字を区別しない）。"""
+    if not os.path.isdir(task_dir):
+        return None
+
+    direct = os.path.join(task_dir, "info.txt")
+    if os.path.isfile(direct):
+        return direct
+
+    try:
+        for name in os.listdir(task_dir):
+            if name.lower() != "info.txt":
+                continue
+            path = os.path.join(task_dir, name)
+            if os.path.isfile(path):
+                return path
+    except OSError:
+        return None
+    return None
+
+
+def _decode_task_info_bytes(raw: bytes) -> list[str]:
+    """info.txt バイト列を複数エンコーディングでデコードして候補文字列を返す。"""
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for encoding in ("utf-8-sig", "utf-8", "cp932", "shift_jis"):
+        try:
+            text = raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        if text not in seen:
+            seen.add(text)
+            candidates.append(text)
+    if not candidates:
+        candidates.append(raw.decode("utf-8", errors="ignore"))
+    return candidates
+
+
+def _format_info_file_mtime(info_path: str) -> str:
+    try:
+        mtime = os.path.getmtime(info_path)
+        return datetime.fromtimestamp(mtime).strftime("%Y/%m/%d %H:%M")
+    except OSError:
+        return ""
+
+
+TASK_LIST_DAT_FILENAME = "taskList.dat"
+_PLACEHOLDER_TASK_TITLES = frozenset({"未登録", ""})
+
+
+def _viscotech_root_from_task_dir(task_dir: str) -> str:
+    """{viscotech}/task/gXX/YY から {viscotech} を返す。"""
+    return os.path.dirname(os.path.dirname(os.path.dirname(task_dir)))
+
+
+def _folder_group_task_ids(task_dir: str) -> tuple[int, int, str]:
+    """タスクフォルダパスから (group_num, task_num, task_folder_name) を返す。"""
+    task_name = os.path.basename(task_dir)
+    group_name = os.path.basename(os.path.dirname(task_dir))
+    group_num = int(re.sub(r"^g", "", group_name, flags=re.IGNORECASE))
+    task_num = int(task_name)
+    return group_num, task_num, task_name
+
+
+def _is_usable_task_title(title: Optional[str]) -> bool:
+    if not title:
+        return False
+    return title.strip() not in _PLACEHOLDER_TASK_TITLES
+
+
+def _is_usable_updated_at(updated_at: Optional[str]) -> bool:
+    if not updated_at:
+        return False
+    normalized = updated_at.strip()
+    if not normalized:
+        return False
+    if normalized.startswith("0000/"):
+        return False
+    if normalized.startswith("0000-"):
+        return False
+    return True
+
+
+def _default_task_title(task_folder_name: str) -> str:
+    """VTV 既定のタスク名（例: フォルダ 01 → タスク01）。"""
+    return f"タスク{format_value(task_folder_name)}"
+
+
+def _latest_image_mtime(img_dir: str) -> str:
+    """img フォルダ内 BMP の最新更新日時を表示用文字列で返す。"""
+    if not os.path.isdir(img_dir):
+        return ""
+    latest_mtime = 0.0
+    try:
+        for name in os.listdir(img_dir):
+            if not name.lower().endswith(".bmp"):
+                continue
+            path = os.path.join(img_dir, name)
+            if not os.path.isfile(path):
+                continue
+            latest_mtime = max(latest_mtime, os.path.getmtime(path))
+    except OSError:
+        return ""
+    if latest_mtime <= 0:
+        return ""
+    return datetime.fromtimestamp(latest_mtime).strftime("%Y/%m/%d %H:%M")
+
+
+def load_task_list_dat_index(
+    viscotech_root: str,
+) -> dict[tuple[int, int], tuple[str, str, str]]:
+    """taskList.dat を (group_num, task_num) キーの辞書に読み込む。"""
+    path = os.path.join(viscotech_root, TASK_LIST_DAT_FILENAME)
+    if not os.path.isfile(path):
+        return {}
+
+    try:
+        with open(path, "rb") as dat_file:
+            raw = dat_file.read(MAX_ZIP_TEXT_BYTES)
+    except OSError as ex:
+        print(f"taskList.dat の読込に失敗しました: {path} - {ex}")
+        return {}
+
+    index: dict[tuple[int, int], tuple[str, str, str]] = {}
+    for raw_text in _decode_task_info_bytes(raw):
+        lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
+        if len(lines) < 2:
+            continue
+        header_line = lines[0]
+        for data_line in lines[1:]:
+            parts = data_line.split(",")
+            if len(parts) < 5:
+                continue
+            try:
+                task_num = int(parts[1].strip())
+                group_num = int(parts[2].strip())
+            except ValueError:
+                continue
+            title, comment, updated_at = parse_task_info_txt(
+                f"{header_line}\n{data_line}",
+            )
+            index[(group_num, task_num)] = (
+                title or "",
+                comment or "",
+                updated_at or "",
+            )
+        if index:
+            return index
+    return index
+
+
+def resolve_task_folder_metadata(
+    task_dir: str,
+    task_list_index: Optional[dict[tuple[int, int], tuple[str, str, str]]] = None,
+) -> tuple[str, str, str]:
+    """info.txt / taskList.dat / 画像更新日時から表示用メタデータを解決する。"""
+    title, comment, updated_at = read_task_folder_info(task_dir)
+    group_num, task_num, task_name = _folder_group_task_ids(task_dir)
+
+    if task_list_index is None:
+        viscotech_root = _viscotech_root_from_task_dir(task_dir)
+        task_list_index = load_task_list_dat_index(viscotech_root)
+
+    list_entry = task_list_index.get((group_num, task_num))
+    if list_entry:
+        list_title, list_comment, list_updated = list_entry
+        if not _is_usable_task_title(title) and _is_usable_task_title(list_title):
+            title = list_title
+        if not comment and list_comment:
+            comment = list_comment
+        if not _is_usable_updated_at(updated_at) and _is_usable_updated_at(list_updated):
+            updated_at = list_updated
+
+    if not _is_usable_task_title(title):
+        title = _default_task_title(task_name)
+
+    if not _is_usable_updated_at(updated_at):
+        img_dir = os.path.join(task_dir, "img")
+        updated_at = _latest_image_mtime(img_dir)
+        if not updated_at:
+            try:
+                updated_at = _format_info_file_mtime(task_dir)
+            except OSError:
+                updated_at = ""
+
+    return title, comment, updated_at
+
+
+def read_task_folder_info(
+    task_dir: str,
+) -> tuple[str, str, str]:
+    """{task_dir}/info.txt から (title, comment, updated_at) を返す。"""
+    info_path = find_task_info_path_on_disk(task_dir)
+    if not info_path:
+        return "", "", ""
+    try:
+        with open(info_path, "rb") as info_file:
+            raw = info_file.read(MAX_ZIP_TEXT_BYTES)
+    except OSError as ex:
+        print(f"info.txt の読込に失敗しました: {info_path} - {ex}")
+        return "", "", ""
+
+    best = ("", "", "")
+    for raw_text in _decode_task_info_bytes(raw):
+        title, comment, updated_at = parse_task_info_txt(raw_text)
+        parsed = (title or "", comment or "", updated_at or "")
+        if any(parsed):
+            return parsed
+        best = parsed
+
+    fallback_updated = _format_info_file_mtime(info_path)
+    return best[0], best[1], best[2] or fallback_updated
+
+
+def count_task_bmp_files(img_dir: str) -> int:
+    """img フォルダ内の BMP ファイル数を返す。"""
+    if not os.path.isdir(img_dir):
+        return 0
+    return sum(
+        1
+        for name in os.listdir(img_dir)
+        if name.lower().endswith(".bmp")
+        and os.path.isfile(os.path.join(img_dir, name))
+    )
+
+
+def extract_ordered_bmp_paths_from_folder(img_folder: str) -> list[str]:
+    """img フォルダ内の FILE= 順 BMP 絶対パス一覧を返す。"""
+    if not os.path.isdir(img_folder):
+        return []
+
+    bmp_files = sorted(
+        os.path.join(img_folder, name)
+        for name in os.listdir(img_folder)
+        if name.lower().endswith(".bmp")
+        and os.path.isfile(os.path.join(img_folder, name))
+    )
+    txt_files = sorted(
+        os.path.join(img_folder, name)
+        for name in os.listdir(img_folder)
+        if name.lower().endswith(".txt")
+        and os.path.isfile(os.path.join(img_folder, name))
+    )
+    if not txt_files:
+        return bmp_files
+
+    referenced_names: list[str] = []
+    try:
+        with open(txt_files[0], "rb") as txt_file:
+            txt_bytes = txt_file.read(MAX_ZIP_TEXT_BYTES)
+    except OSError:
+        return bmp_files
+
+    for raw_line in txt_bytes.splitlines(keepends=True):
+        line = raw_line.decode("utf-8", errors="ignore")
+        if "FILE=" in line:
+            bmp_name = line.split("FILE=", 1)[1].strip()
+            if bmp_name:
+                referenced_names.append(bmp_name)
+
+    bmp_lookup = {
+        os.path.basename(path).lower(): path
+        for path in bmp_files
+    }
+
+    resolved: list[str] = []
+    for bmp_name in referenced_names:
+        full_path = bmp_lookup.get(bmp_name.lower())
+        if full_path:
+            resolved.append(full_path)
+    return resolved or bmp_files
+
+
+def list_filesystem_task_folders(task_root: str) -> list[TaskFolder]:
+    """{task_root}/gXX/YY/ を走査し TaskFolder 一覧を返す。"""
+    folders: list[TaskFolder] = []
+    if not os.path.isdir(task_root):
+        return folders
+
+    viscotech_root = os.path.dirname(task_root)
+    task_list_index = load_task_list_dat_index(viscotech_root)
+
+    for group_name in sorted(os.listdir(task_root)):
+        if not FILESYSTEM_GROUP_DIR_RE.match(group_name):
+            continue
+        group_path = os.path.join(task_root, group_name)
+        if not os.path.isdir(group_path):
+            continue
+
+        for task_name in sorted(os.listdir(group_path)):
+            task_path = os.path.join(group_path, task_name)
+            if not os.path.isdir(task_path):
+                continue
+
+            img_path = os.path.join(task_path, "img")
+            title, comment, updated_at = resolve_task_folder_metadata(
+                task_path,
+                task_list_index,
+            )
+            folders.append(
+                TaskFolder(
+                    prefix=os.path.abspath(task_path),
+                    label=f"{group_name}/{task_name}",
+                    title=title,
+                    comment=comment,
+                    updated_at=updated_at,
+                    image_count=count_task_bmp_files(img_path),
+                )
+            )
+
+    return sorted(folders, key=lambda folder: _task_folder_sort_key(folder.label))
 
 
 def extract_ordered_bmp_paths_from_zip(

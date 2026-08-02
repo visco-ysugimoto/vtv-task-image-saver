@@ -12,6 +12,7 @@ import traceback
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Callable, Optional
 
 import save_task_images_CamNum_selection
@@ -19,17 +20,21 @@ from PIL import Image
 from security_limits import (
     ImageSizeError,
     open_image_from_bytes,
+    open_image_file,
     read_zip_member,
 )
 from utils import (
     TaskFolder,
     TaskZipMetadata,
     convert_bmp_to_jpeg,
+    extract_ordered_bmp_paths_from_folder,
     extract_ordered_bmp_paths_from_zip,
     extract_task_file,
     extract_task_zip_metadata,
     list_task_folders_with_metadata,
+    parse_task_version_text,
     pick_sample_paths,
+    resolve_task_folder_metadata,
 )
 
 ALLOWED_PLACEHOLDERS = {"comment", "tool", "original", "cam", "div", "index", "file"}
@@ -45,6 +50,15 @@ class TaskPreviewLoadResult:
     thumbnail_paths: list[str]
     all_bmp_paths: list[str]
     metadata: Optional[TaskZipMetadata] = None
+
+
+@dataclass
+class ViewerImageAsset:
+    """拡大プレビュー用の原寸 BMP 一時ファイル情報。"""
+
+    temp_path: str
+    width: int
+    height: int
 
 
 @dataclass
@@ -276,6 +290,138 @@ def extract_preview_thumbnails(
         zip_path, task_prefix, max_images, thumb_size,
     )
     return result.total_bmp_count, result.thumbnail_bytes, result.thumbnail_paths
+
+
+def extract_viewer_bmp_from_zip(
+    zip_path: str,
+    bmp_path_in_zip: str,
+) -> Optional[ViewerImageAsset]:
+    """zip 内 BMP をリサイズせず一時ファイルへ書き出し、寸法と共に返す。"""
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            raw = read_zip_member(zf, bmp_path_in_zip)
+            img = open_image_from_bytes(raw)
+            width, height = img.size
+            fd, tmp_path = tempfile.mkstemp(suffix=".bmp")
+            os.close(fd)
+            with open(tmp_path, "wb") as out:
+                out.write(raw)
+            return ViewerImageAsset(
+                temp_path=tmp_path,
+                width=width,
+                height=height,
+            )
+    except (ImageSizeError, Exception):
+        return None
+
+
+def extract_viewer_bmp_from_path(bmp_path: str) -> Optional[ViewerImageAsset]:
+    """ファイルシステム上の BMP を一時ファイルへコピーし、寸法と共に返す。"""
+    if not bmp_path or not os.path.isfile(bmp_path):
+        return None
+    try:
+        with open_image_file(bmp_path) as img:
+            width, height = img.size
+        fd, tmp_path = tempfile.mkstemp(suffix=".bmp")
+        os.close(fd)
+        shutil.copy2(bmp_path, tmp_path)
+        return ViewerImageAsset(
+            temp_path=tmp_path,
+            width=width,
+            height=height,
+        )
+    except (ImageSizeError, Exception):
+        return None
+
+
+def extract_task_folder_metadata(task_dir: str) -> TaskZipMetadata:
+    """viscotech/ver.txt と {task_dir}/info.txt から TaskZipMetadata を組み立てる。"""
+    viscotech_root = os.path.dirname(os.path.dirname(os.path.dirname(task_dir)))
+    version: Optional[str] = None
+    last_from_ver: Optional[str] = None
+    ver_path = os.path.join(viscotech_root, "ver.txt")
+    if os.path.isfile(ver_path):
+        try:
+            with open(ver_path, "rb") as ver_file:
+                raw_ver = ver_file.read(65536).decode("utf-8", errors="ignore")
+            version = parse_task_version_text(raw_ver)
+            last_from_ver = datetime_from_path(ver_path)
+        except OSError:
+            pass
+
+    title, comment, last_from_info = resolve_task_folder_metadata(task_dir)
+    last_updated = last_from_info or last_from_ver
+    return TaskZipMetadata(
+        version=version,
+        title=title or None,
+        comment=comment or None,
+        last_updated=last_updated or None,
+    )
+
+
+def datetime_from_path(path: str) -> Optional[str]:
+    """ファイルの更新日時を表示用文字列で返す。"""
+    try:
+        mtime = os.path.getmtime(path)
+        return datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+    except OSError:
+        return None
+
+
+def load_folder_preview(
+    img_folder: str,
+    task_dir: Optional[str] = None,
+    max_images: Optional[int] = 12,
+    thumb_size: tuple[int, int] = (160, 160),
+) -> TaskPreviewLoadResult:
+    """img フォルダからプレビュー用サムネイルと全 BMP 一覧を取得する。"""
+    empty = TaskPreviewLoadResult(0, [], [], [], None)
+    try:
+        all_bmps = extract_ordered_bmp_paths_from_folder(img_folder)
+        metadata = (
+            extract_task_folder_metadata(task_dir)
+            if task_dir
+            else None
+        )
+        selected = pick_sample_paths(all_bmps, max_images)
+        if not selected:
+            return TaskPreviewLoadResult(
+                len(all_bmps), [], [], all_bmps, metadata,
+            )
+
+        def _process_one_bmp(args):
+            idx, full_path = args
+            try:
+                with open_image_file(full_path) as img:
+                    img.thumbnail(thumb_size, Image.Resampling.BILINEAR)
+                    buf = io.BytesIO()
+                    img.convert("RGB").save(buf, format="JPEG", quality=72)
+                    return idx, buf.getvalue(), full_path
+            except (ImageSizeError, Exception):
+                return idx, None, full_path
+
+        to_process = [(i, full_path) for i, full_path in enumerate(selected)]
+        results: list[Optional[tuple[bytes, str]]] = [None] * len(to_process)
+        with ThreadPoolExecutor(
+            max_workers=min(8, len(to_process)),
+        ) as ex:
+            futures = {
+                ex.submit(_process_one_bmp, item): item[0]
+                for item in to_process
+            }
+            for future in as_completed(futures):
+                idx, thumb_bytes, full_path = future.result()
+                if thumb_bytes:
+                    results[idx] = (thumb_bytes, full_path)
+
+        thumbnails = [r[0] for r in results if r is not None]
+        paths = [r[1] for r in results if r is not None]
+        return TaskPreviewLoadResult(
+            len(all_bmps), thumbnails, paths, all_bmps, metadata,
+        )
+    except Exception as ex:
+        print(f"フォルダプレビュー読み込みエラー: {ex}")
+        return empty
 
 
 def save_large_image_from_zip_path(

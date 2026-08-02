@@ -4,13 +4,17 @@ Flet によるタスク画像保存アプリの UI 層。
 """
 import asyncio
 from collections import defaultdict
+import math
 import os
+import re
 import threading
 from datetime import datetime
+from typing import Literal
 
 import flet as ft
+import flet.canvas as cv
 import save_task_images_CamNum_selection
-from config import ConfigManager
+from config import ConfigManager, Constants
 from flet_dropzone_support import (
     dropzone_setup_hint,
     is_file_dropzone_available,
@@ -32,9 +36,23 @@ from flet_ui_constants import (
     PREVIEW_LIMIT_ROW_BOTTOM_GAP,
     PREVIEW_LIMIT_ROW_HEIGHT,
     PREVIEW_LIMIT_TEXT_SIZE,
+    THUMBNAIL_UI_UPDATE_BATCH,
+    LOAD_TASK_LIST_BUTTON_LABEL,
+    LOCAL_TASK_LIST_PLACEHOLDER,
+    LOCAL_TASK_LIST_LOADING,
     SIDEBAR_COLLAPSED_STORAGE_KEY,
     SIDEBAR_WIDTH_COLLAPSED,
     SIDEBAR_WIDTH_EXPANDED,
+    VIEWER_FOOTER_HEIGHT,
+    DEFAULT_VIEWER_GRID_SPACING,
+    VIEWER_GRID_SPACING_OPTIONS,
+    VIEWER_GRID_ZOOM_THRESHOLD,
+    VIEWER_HEADER_HEIGHT,
+    VIEWER_MAX_SCALE,
+    VIEWER_MIN_SCALE,
+    VIEWER_PANEL_HEIGHT,
+    VIEWER_PANEL_PADDING,
+    VIEWER_PANEL_WIDTH,
 )
 from task_image_saver_logic import (
     TemplatePreviewSamples,
@@ -42,13 +60,15 @@ from task_image_saver_logic import (
     build_option3_img_path,
     build_template_preview,
     extract_unknown_placeholders,
+    extract_viewer_bmp_from_path,
+    extract_viewer_bmp_from_zip,
     filter_save_task_folders,
     find_task_folder_by_prefix,
+    load_folder_preview,
     load_task_file_preview,
     parse_int_value,
     prepare_option2_extraction,
     run_image_processing_jobs,
-    save_large_image_from_zip_path,
     snapshot_output_files,
     task_folder_group,
     task_folder_task,
@@ -60,6 +80,7 @@ from utils import (
     format_value,
     is_task_file_path,
     list_task_folders_with_metadata,
+    list_filesystem_task_folders,
 )
 
 class TaskImageSaverApp:
@@ -94,6 +115,12 @@ class TaskImageSaverApp:
         self._option2_task_folders: list[TaskFolder] = []
         self._option2_selected_task_prefix = None
         self._option2_save_task_prefixes = set()
+        self._local_task_folders: list[TaskFolder] = []
+        self._local_selected_task_prefix: str | None = None
+        self._preview_source: Literal["zip", "folder"] = "zip"
+        self._preview_img_folder = ""
+        self._local_task_list_loading = False
+        self._local_preview_generation = 0
         self._launch_task_file = (
             launch_task_file if launch_task_file and is_task_file_path(launch_task_file)
             else None
@@ -132,6 +159,9 @@ class TaskImageSaverApp:
         self.preview_limit_menu = ft.Ref[ft.PopupMenuButton]()
         self.preview_limit_value_text = ft.Ref[ft.Text]()
         self.option2_workspace = ft.Ref[ft.Container]()
+        self.local_task_selection_column = ft.Ref[ft.Column]()
+        self.local_task_workspace = ft.Ref[ft.Container]()
+        self.load_task_list_btn = ft.Ref[ft.ElevatedButton]()
         self.import_source_section = ft.Ref[ft.Container]()
         self.sidebar_container = ft.Ref[ft.Container]()
         self.sidebar_content = ft.Ref[ft.Container]()
@@ -423,7 +453,9 @@ class TaskImageSaverApp:
         if self.warning_text.current:
             self.warning_text.current.value = ""
         self._show_thumbnail_loading()
-        self.page.update()
+        row = self.thumbnail_row.current
+        if row:
+            row.update()
 
         task_folders = await asyncio.to_thread(
             list_task_folders_with_metadata, file_path)
@@ -440,7 +472,237 @@ class TaskImageSaverApp:
 
         await self._load_option2_preview_async(file_path)
         self._last_option2_loaded_file = file_path
+
+    def _current_option(self) -> str:
+        return (
+            self.selected_option.current.value
+            if self.selected_option.current else "option1"
+        )
+
+    def _local_task_list_task_root(self, option: str | None = None) -> str | None:
+        option = option or self._current_option()
+        if option == "option1":
+            return Constants.DEFAULT_VISCO_TECH_PATH
+        if option == "option3":
+            folder = (
+                self.option3_folder_field.current.value
+                if self.option3_folder_field.current else ""
+            )
+            if not folder:
+                return None
+            return os.path.join(folder, "task")
+        return None
+
+    def _is_load_task_list_enabled(self) -> bool:
+        if self._local_task_list_loading:
+            return False
+        if self._current_option() == "option3":
+            return bool(self._local_task_list_task_root("option3"))
+        return True
+
+    def _update_load_task_list_button(self) -> None:
+        btn = self.load_task_list_btn.current
+        if btn is None:
+            return
+        btn.disabled = not self._is_load_task_list_enabled()
+        btn.content = (
+            LOCAL_TASK_LIST_LOADING
+            if self._local_task_list_loading
+            else LOAD_TASK_LIST_BUTTON_LABEL
+        )
+
+    def _on_load_task_list_click(self, _e):
+        self.page.run_task(self._load_local_task_list_async)
+
+    async def _load_local_task_list_async(self):
+        option = self._current_option()
+        task_root = self._local_task_list_task_root(option)
+        if not task_root:
+            if self.warning_text.current:
+                self.warning_text.current.value = (
+                    "外部のviscotechフォルダを選択してください"
+                    if option == "option3"
+                    else "タスクフォルダが見つかりません"
+                )
+            self.page.update()
+            return
+
+        self._local_task_list_loading = True
+        if self.warning_text.current:
+            self.warning_text.current.value = ""
+        self._update_load_task_list_button()
         self.page.update()
+
+        try:
+            folders = await asyncio.to_thread(
+                list_filesystem_task_folders, task_root,
+            )
+        except Exception as exc:
+            if self.warning_text.current:
+                self.warning_text.current.value = (
+                    f"タスク一覧の読み込みエラー: {exc}"
+                )
+            folders = []
+        finally:
+            self._local_task_list_loading = False
+            self._update_load_task_list_button()
+
+        self._local_task_folders = folders
+        self._local_selected_task_prefix = (
+            folders[0].prefix if folders else None
+        )
+        self._update_local_task_list_controls()
+        if self.preview_limit_menu.current:
+            self.preview_limit_menu.current.disabled = False
+        self.page.update()
+
+        if folders and self._local_selected_task_prefix:
+            await self._load_local_task_preview(self._local_selected_task_prefix)
+
+    def _sync_group_task_fields_from_folder(self, folder: TaskFolder) -> None:
+        group = task_folder_group(folder)
+        task = task_folder_task(folder)
+        group_num = re.sub(r"^g", "", group, flags=re.IGNORECASE)
+        if self.group_num_field.current:
+            try:
+                self.group_num_field.current.value = str(int(group_num))
+            except ValueError:
+                self.group_num_field.current.value = group_num
+        if self.task_num_field.current:
+            try:
+                self.task_num_field.current.value = str(int(task))
+            except ValueError:
+                self.task_num_field.current.value = task
+
+    def _update_local_task_list_controls(self):
+        selection_column = self.local_task_selection_column.current
+        if not selection_column:
+            return
+
+        selection_column.controls.clear()
+        folders = self._local_task_folders
+        if not folders:
+            selection_column.controls.append(
+                ft.Text(
+                    LOCAL_TASK_LIST_PLACEHOLDER,
+                    size=11,
+                    color=ft.Colors.GREY_500,
+                )
+            )
+            selection_column.update()
+            return
+
+        current_prefix = self._local_selected_task_prefix
+        for folder in folders:
+            is_current = folder.prefix == current_prefix
+            group = task_folder_group(folder)
+            task = task_folder_task(folder)
+            title = folder.title or "タイトルなし"
+            comment = folder.comment or ""
+            has_images = folder.image_count > 0
+            image_status = (
+                f"画像 {folder.image_count}枚" if has_images else "画像なし"
+            )
+            image_status_color = (
+                ft.Colors.GREEN_700 if has_images else ft.Colors.RED_700
+            )
+            selection_column.controls.append(
+                ft.Container(
+                    bgcolor=(
+                        ft.Colors.BLUE_50 if is_current else ft.Colors.WHITE
+                    ),
+                    border=ft.Border.all(
+                        1,
+                        ft.Colors.BLUE_200
+                        if is_current else ft.Colors.GREY_200,
+                    ),
+                    border_radius=6,
+                    padding=ft.Padding.symmetric(horizontal=6, vertical=4),
+                    ink=True,
+                    on_click=lambda e, task_folder=folder:
+                        self._select_local_task_folder(task_folder),
+                    content=ft.Row([
+                        ft.Text(group, width=42, size=11,
+                                weight=ft.FontWeight.W_500),
+                        ft.Text(task, width=32, size=11),
+                        ft.Text(
+                            image_status,
+                            width=64,
+                            size=11,
+                            color=image_status_color,
+                            weight=ft.FontWeight.W_500,
+                        ),
+                        ft.Column([
+                            ft.Text(
+                                title, size=12,
+                                weight=ft.FontWeight.W_500,
+                                overflow=ft.TextOverflow.ELLIPSIS,
+                            ),
+                            ft.Text(
+                                comment, size=11,
+                                color=ft.Colors.GREY_700,
+                                overflow=ft.TextOverflow.ELLIPSIS,
+                                max_lines=1,
+                            ),
+                            *(
+                                [ft.Text(
+                                    self._folder_meta_line(folder, is_current),
+                                    size=10,
+                                    color=ft.Colors.BLUE_700,
+                                    overflow=ft.TextOverflow.ELLIPSIS,
+                                    max_lines=1,
+                                )]
+                                if self._folder_meta_line(folder, is_current)
+                                else []
+                            ),
+                        ], spacing=0, expand=True),
+                    ], spacing=4,
+                       vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                )
+            )
+
+        selection_column.update()
+
+    def _select_local_task_folder(self, folder: TaskFolder):
+        self.page.run_task(self._load_local_task_preview, folder.prefix)
+
+    async def _load_local_task_preview(self, task_prefix: str):
+        selected = find_task_folder_by_prefix(
+            self._local_task_folders, task_prefix,
+        )
+        if not selected:
+            return
+
+        self._local_preview_generation += 1
+        generation = self._local_preview_generation
+        self._local_selected_task_prefix = selected.prefix
+        self._sync_group_task_fields_from_folder(selected)
+        self._update_local_task_list_controls()
+        self._show_thumbnail_loading()
+        row = self.thumbnail_row.current
+        if row:
+            row.update()
+
+        img_folder = os.path.join(selected.prefix, "img")
+        max_images = self._current_preview_limit()
+        result = await asyncio.to_thread(
+            load_folder_preview,
+            img_folder,
+            selected.prefix,
+            max_images,
+            (160, 160),
+        )
+        if generation != self._local_preview_generation:
+            return
+
+        self._apply_task_preview_result(
+            result,
+            preview_source="folder",
+            source_path=img_folder,
+        )
+        self._enrich_task_folder_from_metadata(selected, result.metadata)
+        self._update_local_task_list_controls()
+        await self._update_thumbnail_display_async()
 
     async def _bootstrap_launch_preview_async(self):
         """右クリック起動: Option2 を開いて初回タスクを読み込む。"""
@@ -485,17 +747,40 @@ class TaskImageSaverApp:
         if self.preview_limit_value_text.current:
             self.preview_limit_value_text.current.value = self._preview_limit_value
         self.page.update()
-        self.page.run_task(self._reload_option2_preview)
+        self.page.run_task(self._reload_current_preview)
 
-    def _apply_task_preview_result(self, file_path: str, result) -> None:
+    async def _reload_current_preview(self):
+        option = (
+            self.selected_option.current.value
+            if self.selected_option.current else "option1"
+        )
+        if option == "option2":
+            await self._reload_option2_preview()
+        elif (
+            option in ("option1", "option3")
+            and self._local_selected_task_prefix
+        ):
+            await self._load_local_task_preview(self._local_selected_task_prefix)
+
+    def _apply_task_preview_result(
+        self,
+        result,
+        *,
+        preview_source: Literal["zip", "folder"],
+        source_path: str = "",
+    ) -> None:
         self._file_thumbnails = result.thumbnail_bytes
         self._file_thumbnail_count = result.total_bmp_count
-        self._preview_zip_path = file_path
         self._preview_bmp_names = result.thumbnail_paths
         self._option2_all_bmp_paths = result.all_bmp_paths
         self._option2_task_metadata = result.metadata
-        self._update_option2_metadata_display()
-        self._update_option2_save_task_controls()
+        self._preview_source = preview_source
+        if preview_source == "zip":
+            self._preview_zip_path = source_path
+            self._preview_img_folder = ""
+        else:
+            self._preview_zip_path = ""
+            self._preview_img_folder = source_path
 
     def _format_option2_meta_summary(self) -> str:
         """選択タスクのメタデータを1行にまとめる。"""
@@ -509,18 +794,89 @@ class TaskImageSaverApp:
             parts.append(f"更新 {meta.last_updated}")
         return " · ".join(parts)
 
+    def _enrich_task_folder_from_metadata(
+        self,
+        folder: TaskFolder,
+        metadata,
+    ) -> None:
+        if not metadata:
+            return
+        if metadata.title:
+            folder.title = metadata.title
+        if metadata.comment:
+            folder.comment = metadata.comment
+        if metadata.last_updated:
+            folder.updated_at = metadata.last_updated
+
     def _folder_meta_line(self, folder: TaskFolder, is_current: bool) -> str:
         """リスト行用のメタ情報（Ver・更新日など）。"""
+        parts: list[str] = []
         if is_current:
             summary = self._format_option2_meta_summary()
             if summary:
                 return summary
         if folder.updated_at:
-            return f"更新 {folder.updated_at}"
-        return ""
+            parts.append(f"更新 {folder.updated_at}")
+        return " · ".join(parts)
 
-    def _update_option2_metadata_display(self) -> None:
-        self._update_thumbnail_display()
+    def _thumbnail_info_text(self) -> str:
+        shown = len(self._file_thumbnails)
+        meta = self._format_option2_meta_summary()
+        if self._file_thumbnail_count > 0:
+            text = (
+                f"{self._file_thumbnail_count}枚検出 / 表示{shown}枚"
+                f" · クリックで拡大（ズーム/全画面可）"
+            )
+            if meta:
+                text += f" · {meta}"
+            return text
+        return "画像プレビュー"
+
+    async def _update_thumbnail_display_async(self) -> None:
+        """サムネイル行を分割更新し UI スレッドの固まりを防ぐ。"""
+        row = self.thumbnail_row.current
+        info = self.thumbnail_info.current
+        if not row:
+            return
+
+        row.controls.clear()
+        thumbs = self._file_thumbnails
+        if thumbs:
+            row.alignment = ft.MainAxisAlignment.START
+            batch_size = THUMBNAIL_UI_UPDATE_BATCH
+            for i, img_bytes in enumerate(thumbs):
+                row.controls.append(
+                    self._build_thumbnail_tile(img_bytes, i)
+                )
+                if (i + 1) % batch_size == 0:
+                    if info:
+                        info.value = self._thumbnail_info_text()
+                    await asyncio.sleep(0)
+                    if info:
+                        row.update()
+                        info.update()
+                    else:
+                        row.update()
+        else:
+            row.alignment = ft.MainAxisAlignment.CENTER
+            if self._file_thumbnail_count == 0:
+                row.controls.append(
+                    ft.Text(
+                        "画像が見つかりませんでした",
+                        size=11,
+                        color=ft.Colors.GREY_400,
+                        italic=True,
+                    )
+                )
+
+        if info:
+            info.value = self._thumbnail_info_text()
+        await asyncio.sleep(0)
+        if info:
+            row.update()
+            info.update()
+        else:
+            row.update()
 
     async def _load_option2_preview_async(self, file_path: str) -> None:
         max_images = self._current_preview_limit()
@@ -531,7 +887,12 @@ class TaskImageSaverApp:
             max_images,
             (160, 160),
         )
-        self._apply_task_preview_result(file_path, result)
+        self._apply_task_preview_result(
+            result,
+            preview_source="zip",
+            source_path=file_path,
+        )
+        await self._update_thumbnail_display_async()
 
     def _preview_limit_menu_items(self) -> list[ft.PopupMenuItem]:
         items: list[ft.PopupMenuItem] = []
@@ -555,9 +916,10 @@ class TaskImageSaverApp:
         if not file_path:
             return
         self._show_thumbnail_loading()
-        self.page.update()
+        row = self.thumbnail_row.current
+        if row:
+            row.update()
         await self._load_option2_preview_async(file_path)
-        self.page.update()
 
     def _selected_option2_task_folder(self):
         return find_task_folder_by_prefix(
@@ -699,6 +1061,8 @@ class TaskImageSaverApp:
             else:
                 info_control.value = f"保存対象: 全 {total_count} タスク"
 
+        selection_column.update()
+
     def _select_option2_task_folder(self, folder):
         self.page.run_task(self._load_option2_task_preview, folder.prefix)
 
@@ -748,31 +1112,24 @@ class TaskImageSaverApp:
         self._option2_selected_task_prefix = selected.prefix
         self._update_option2_save_task_controls()
         self._show_thumbnail_loading()
-        self.page.update()
+        row = self.thumbnail_row.current
+        if row:
+            row.update()
 
         file_path = self.file_path.current.value if self.file_path.current else ""
         await self._load_option2_preview_async(file_path)
-        self._update_option2_save_task_controls()
-        self.page.update()
 
     def _viewer_bmp_paths(self) -> list[str]:
         return self._option2_all_bmp_paths or self._preview_bmp_names
 
-    def _save_large_image_to_temp(
-        self,
-        bmp_index: int,
-        *,
-        max_size: tuple[int, int] = (3840, 2160),
-    ):
-        """zip から画像を取得し一時ファイルに保存してパスを返す"""
-        paths = self._viewer_bmp_paths()
-        if not paths or bmp_index < 0 or bmp_index >= len(paths):
-            return None
-        return save_large_image_from_zip_path(
-            self._preview_zip_path,
-            paths[bmp_index],
-            max_size=max_size,
-        )
+    @staticmethod
+    def _remove_temp_file(path: str | None) -> None:
+        if not path:
+            return
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
     def _close_image_viewer(self):
         """表示中の画像プレビューオーバーレイを閉じる。"""
@@ -782,8 +1139,12 @@ class TaskImageSaverApp:
             cleanup()
 
     def _show_enlarged_image(self, thumb_index: int):
-        """サムネイルクリック時に zip から拡大画像を表示する"""
-        if not self._preview_bmp_names or not self._preview_zip_path:
+        """サムネイルクリック時に拡大画像を表示する"""
+        if not self._preview_bmp_names:
+            return
+        if self._preview_source == "zip" and not self._preview_zip_path:
+            return
+        if self._preview_source == "folder" and not self._preview_img_folder:
             return
         path = self._preview_bmp_names[thumb_index]
         paths = self._viewer_bmp_paths()
@@ -795,43 +1156,452 @@ class TaskImageSaverApp:
 
     def _open_image_viewer(self, start_index: int):
         bmp_paths = self._viewer_bmp_paths()
-        if not bmp_paths or not self._preview_zip_path:
+        if not bmp_paths:
+            return
+        if self._preview_source == "zip" and not self._preview_zip_path:
+            return
+        if self._preview_source == "folder" and not self._preview_img_folder:
             return
 
         self._close_image_viewer()
 
-        tmp_path = self._save_large_image_to_temp(start_index)
-        if not tmp_path:
-            return
-
         state = {
             "idx": start_index,
-            "tmp": tmp_path,
+            "bmp_tmp": None,
+            "width": 0,
+            "height": 0,
             "fullscreen": False,
             "prev_window_full_screen": bool(self.page.window.full_screen),
+            "viewer_scale": 1.0,
+            "tx": 0.0,
+            "ty": 0.0,
+            "gesture_start_scale": 1.0,
+            "gesture_ref_scene": None,
+            "gesture_prev_focal": None,
+            "gesture_was_pan": False,
+            "fit_scale": 1.0,
+            "grid_enabled": True,
+            "grid_spacing": DEFAULT_VIEWER_GRID_SPACING,
+            "grid_visible": False,
+            "grid_drawn": None,
+            "grid_rebuild_busy": False,
+            "load_generation": 0,
         }
         overlay_ref = ft.Ref[ft.Container]()
         panel_ref = ft.Ref[ft.Container]()
         viewer_area_ref = ft.Ref[ft.Container]()
         viewer_ref = ft.Ref[ft.InteractiveViewer]()
+        stack_ref = ft.Ref[ft.Stack]()
         img_ref = ft.Ref[ft.Image]()
+        grid_canvas_ref = ft.Ref[cv.Canvas]()
+        loading_ref = ft.Ref[ft.Container]()
         counter_ref = ft.Ref[ft.Text]()
         name_ref = ft.Ref[ft.Text]()
         fullscreen_btn_ref = ft.Ref[ft.IconButton]()
+        grid_toggle_btn_ref = ft.Ref[ft.IconButton]()
+        grid_spacing_text_ref = ft.Ref[ft.Text]()
         header_ref = ft.Ref[ft.Row]()
         footer_ref = ft.Ref[ft.Container]()
 
-        def reset_zoom():
-            if viewer_ref.current:
-                viewer_ref.current.reset()
 
-        def zoom_in(_e):
-            if viewer_ref.current:
-                viewer_ref.current.zoom(1.25)
+        def cleanup_viewer_temps() -> None:
+            self._remove_temp_file(state.get("bmp_tmp"))
+            state["bmp_tmp"] = None
 
-        def zoom_out(_e):
-            if viewer_ref.current:
-                viewer_ref.current.zoom(0.8)
+        def viewer_area_size() -> tuple[float, float]:
+            """画像表示領域（InteractiveViewer）の論理サイズを返す。"""
+            if state["fullscreen"]:
+                width = float(self.page.width or VIEWER_PANEL_WIDTH)
+                height = (
+                    float(self.page.height or VIEWER_PANEL_HEIGHT)
+                    - VIEWER_FOOTER_HEIGHT
+                )
+            else:
+                width = VIEWER_PANEL_WIDTH - 2 * VIEWER_PANEL_PADDING
+                height = (
+                    VIEWER_PANEL_HEIGHT
+                    - 2 * VIEWER_PANEL_PADDING
+                    - VIEWER_HEADER_HEIGHT
+                    - VIEWER_FOOTER_HEIGHT
+                )
+            return max(width, 1.0), max(height, 1.0)
+
+        # グリッドは Canvas で可視範囲＋余白のみ描画する（透過PNG重ねは
+        # Flet クライアントで全面グレーになるため使用しない）。
+        # Path は丸ごと差し替え、要素生成はワーカースレッドで行う。
+        GRID_LINE_BUDGET = 1200.0
+        GRID_VIEW_MARGIN = 0.5
+
+        # パン終了時の慣性摩擦係数。Flutter の FrictionSimulation は速度が
+        # drag^t で減衰するため「小さいほど即停止」する（0.01 のような値は
+        # 逆にデフォルトより慣性が伸びる）。慣性アニメーション中は update
+        # イベントが届かず変換追跡がずれるので、実質ゼロまで小さくする
+        # （最大移動量 = 速度 / |ln(drag)| ≒ 速度/690 ≦ 数px）。
+        FLING_FRICTION = 1e-300
+        FLING_LOG = abs(math.log(FLING_FRICTION))
+
+        def grid_show_threshold() -> float:
+            """グリッド表示を開始する倍率（間隔が広いほど低倍率で表示）。"""
+            spacing = max(1, int(state["grid_spacing"]))
+            return float(VIEWER_GRID_ZOOM_THRESHOLD) / spacing
+
+        def grid_hide_threshold() -> float:
+            """グリッドを隠す倍率（ヒステリシスで境界付近のチラつきを防ぐ）。"""
+            return grid_show_threshold() * 0.85
+
+        def grid_should_show(scale: float) -> bool:
+            if not state["grid_enabled"] or state["width"] <= 0:
+                return False
+            if scale >= grid_show_threshold():
+                return True
+            if scale < grid_hide_threshold():
+                return False
+            return state["grid_visible"]
+
+        def visible_content_rect() -> tuple[float, float, float, float]:
+            """表示領域に映っているコンテンツ座標範囲を返す。"""
+            scale = max(state["viewer_scale"], 1e-6)
+            area_w, area_h = viewer_area_size()
+            x0 = (0 - state["tx"]) / scale
+            y0 = (0 - state["ty"]) / scale
+            return x0, y0, x0 + area_w / scale, y0 + area_h / scale
+
+        def _grid_region() -> tuple[int, int, int, int] | None:
+            width, height = state["width"], state["height"]
+            if width <= 0 or height <= 0:
+                return None
+            x0, y0, x1, y1 = visible_content_rect()
+            step = max(1, int(state["grid_spacing"]))
+            vis_lines = (x1 - x0) / step + (y1 - y0) / step
+            margin = min(
+                GRID_VIEW_MARGIN,
+                max(
+                    0.0,
+                    (GRID_LINE_BUDGET - vis_lines)
+                    / max(2 * vis_lines, 1e-6),
+                ),
+            )
+            mx = (x1 - x0) * margin
+            my = (y1 - y0) * margin
+            gx0 = max(0, math.floor(x0 - mx))
+            gx1 = min(width, math.ceil(x1 + mx))
+            gy0 = max(0, math.floor(y0 - my))
+            gy1 = min(height, math.ceil(y1 + my))
+            if gx1 <= gx0 or gy1 <= gy0:
+                return None
+            return gx0, gy0, gx1, gy1
+
+        def _grid_elements_for_region(
+            gx0: int, gy0: int, gx1: int, gy1: int,
+            width: int, height: int,
+            step: int = 1,
+        ) -> list[cv.Path.PathElement]:
+            step = max(1, int(step))
+            elements: list[cv.Path.PathElement] = []
+            x_lo = max(1, gx0)
+            x_hi = min(width - 1, gx1)
+            x_start = ((x_lo + step - 1) // step) * step
+            for x in range(x_start, x_hi + 1, step):
+                elements.append(cv.Path.MoveTo(x, gy0))
+                elements.append(cv.Path.LineTo(x, gy1))
+            y_lo = max(1, gy0)
+            y_hi = min(height - 1, gy1)
+            y_start = ((y_lo + step - 1) // step) * step
+            for y in range(y_start, y_hi + 1, step):
+                elements.append(cv.Path.MoveTo(gx0, y))
+                elements.append(cv.Path.LineTo(gx1, y))
+            return elements
+
+        def _viewer_is_active() -> bool:
+            return self._image_viewer_cleanup is not None
+
+        def clear_grid_cache():
+            """画像切替時にグリッドの描画キャッシュを破棄する。"""
+            canvas = grid_canvas_ref.current
+            state["grid_drawn"] = None
+            state["grid_rebuild_busy"] = False
+            state["grid_visible"] = False
+            if canvas:
+                canvas.shapes = []
+                canvas.visible = False
+
+        def hide_grid_now():
+            """グリッドを隠す。"""
+            if not _viewer_is_active():
+                return
+            canvas = grid_canvas_ref.current
+            if not canvas or not state["grid_visible"]:
+                return
+            state["grid_visible"] = False
+            state["grid_drawn"] = None
+            canvas.shapes = []
+            canvas.visible = False
+            canvas.update()
+
+        async def rebuild_grid_async():
+            """可視範囲のグリッドを非同期で再構築する。"""
+            if not _viewer_is_active() or state.get("grid_rebuild_busy"):
+                return
+            scale = max(state["viewer_scale"], 1e-6)
+            if not grid_should_show(scale):
+                hide_grid_now()
+                return
+
+            region = _grid_region()
+            if region is None:
+                hide_grid_now()
+                return
+            gx0, gy0, gx1, gy1 = region
+            width, height = state["width"], state["height"]
+            drawn = state.get("grid_drawn")
+            spacing = max(1, int(state["grid_spacing"]))
+            if (
+                state["grid_visible"]
+                and drawn
+                and drawn[0] == (gx0, gy0, gx1, gy1)
+                and drawn[1] == spacing
+                and abs(drawn[2] - scale) / max(scale, 1e-6) < 0.02
+            ):
+                return
+
+            state["grid_rebuild_busy"] = True
+            try:
+                elements = await asyncio.to_thread(
+                    _grid_elements_for_region,
+                    gx0, gy0, gx1, gy1, width, height,
+                    spacing,
+                )
+                await asyncio.sleep(0)
+                if not _viewer_is_active() or not grid_should_show(scale):
+                    return
+                canvas = grid_canvas_ref.current
+                if not canvas:
+                    return
+                canvas.shapes = [
+                    cv.Path(
+                        elements=elements,
+                        paint=ft.Paint(
+                            color=ft.Colors.with_opacity(
+                                0.6, ft.Colors.BLUE_400,
+                            ),
+                            stroke_width=min(
+                                0.25, max(0.03, 1.0 / scale),
+                            ),
+                            style=ft.PaintingStyle.STROKE,
+                        ),
+                    ),
+                ]
+                state["grid_drawn"] = ((gx0, gy0, gx1, gy1), spacing, scale)
+                state["grid_visible"] = True
+                canvas.visible = True
+                canvas.update()
+            finally:
+                state["grid_rebuild_busy"] = False
+
+        def sync_grid():
+            """しきい値に応じてグリッドを再構築または非表示にする。"""
+            if not _viewer_is_active():
+                return
+            scale = max(state["viewer_scale"], 1e-6)
+            if not grid_should_show(scale):
+                hide_grid_now()
+                return
+            self.page.run_task(rebuild_grid_async)
+
+        async def sync_grid_deferred():
+            """UIイベント処理後にグリッド表示を同期する。"""
+            await asyncio.sleep(0)
+            sync_grid()
+
+        # reset/zoom/pan の3呼び出しは非アトミックなため、ボタン連打などで
+        # 並行実行されると実際の変換と追跡値がずれる。ロックで直列化する。
+        transform_lock = asyncio.Lock()
+
+        async def _set_scale_centered_locked(scale: float):
+            viewer = viewer_ref.current
+            if not viewer or state["width"] <= 0:
+                return
+            min_scale = float(viewer.min_scale or VIEWER_MIN_SCALE)
+            scale = max(min_scale, min(VIEWER_MAX_SCALE, scale))
+            area_w, area_h = viewer_area_size()
+            await viewer.reset()
+            if abs(scale - 1.0) > 1e-6:
+                await viewer.zoom(scale)
+            # zoom() は原点基準のため、中央寄せ分を pan で補正する
+            # （pan の移動量はコンテンツ座標系 = 倍率適用前の値）
+            dx = (area_w - state["width"] * scale) / (2 * scale)
+            dy = (area_h - state["height"] * scale) / (2 * scale)
+            await viewer.pan(dx, dy)
+            state["viewer_scale"] = scale
+            # 変換行列を正確に記録（screen = scale * content + t）
+            state["tx"] = scale * dx
+            state["ty"] = scale * dy
+            sync_grid()
+
+        async def set_scale_centered(scale: float):
+            """指定倍率で画像中心が表示領域中央に来るよう変換を組み直す。"""
+            async with transform_lock:
+                await _set_scale_centered_locked(scale)
+
+        async def apply_fit_async(*, wait_layout: bool = False):
+            """画像全体が収まる倍率にリセットする。"""
+            viewer = viewer_ref.current
+            if not viewer or state["width"] <= 0:
+                return
+            if wait_layout:
+                # 全画面切替直後はページサイズ反映を待つ
+                await asyncio.sleep(0.25)
+            area_w, area_h = viewer_area_size()
+            fit = min(
+                area_w / state["width"],
+                area_h / state["height"],
+                1.0,
+            )
+            fit = max(fit, VIEWER_MIN_SCALE)
+            state["fit_scale"] = fit
+            viewer.min_scale = max(VIEWER_MIN_SCALE, min(0.5, fit))
+            viewer.update()
+            await set_scale_centered(fit)
+
+        def reset_zoom(_e=None):
+            self.page.run_task(apply_fit_async)
+
+        async def zoom_in(_e):
+            # 現在倍率はロック取得後に読む（連打時の取りこぼし防止）
+            async with transform_lock:
+                await _set_scale_centered_locked(state["viewer_scale"] * 1.5)
+
+        async def zoom_out(_e):
+            async with transform_lock:
+                await _set_scale_centered_locked(state["viewer_scale"] / 1.5)
+
+        async def zoom_to_original(_e):
+            """画像1ピクセル = 画面1ピクセル（等倍）にする。"""
+            await set_scale_centered(1.0)
+
+        def zoom_in_click(_e):
+            self.page.run_task(zoom_in, _e)
+
+        def zoom_out_click(_e):
+            self.page.run_task(zoom_out, _e)
+
+        def zoom_to_original_click(_e):
+            self.page.run_task(zoom_to_original, _e)
+
+        def on_interaction_start(e):
+            # ジェスチャー開始時の倍率と、焦点直下のコンテンツ座標を記録。
+            # ホイールズームは1ティックごとに start/update/end を発生させ、
+            # ドラッグ中に割り込むこともある（その場合も基準を取り直す）。
+            scale = max(state["viewer_scale"], 1e-6)
+            state["gesture_start_scale"] = scale
+            state["gesture_ref_scene"] = (
+                (e.local_focal_point.x - state["tx"]) / scale,
+                (e.local_focal_point.y - state["ty"]) / scale,
+            )
+            state["gesture_prev_focal"] = (
+                e.local_focal_point.x,
+                e.local_focal_point.y,
+            )
+            state["gesture_was_pan"] = False
+            hide_grid_now()
+
+        def on_interaction_update(e):
+            ref = state.get("gesture_ref_scene")
+            prev = state.get("gesture_prev_focal")
+            if not ref or not prev:
+                return
+            fx, fy = e.local_focal_point.x, e.local_focal_point.y
+            if abs(e.scale - 1.0) > 1e-9:
+                # ズーム系（ホイール / ピンチ）: Flutter と同じ
+                # 「焦点直下のコンテンツ点を維持」する変換を再現
+                viewer = viewer_ref.current
+                min_scale = float(
+                    (viewer.min_scale if viewer else None)
+                    or VIEWER_MIN_SCALE
+                )
+                scale = max(
+                    min_scale,
+                    min(
+                        VIEWER_MAX_SCALE,
+                        state["gesture_start_scale"] * e.scale,
+                    ),
+                )
+                state["viewer_scale"] = scale
+                state["tx"] = fx - scale * ref[0]
+                state["ty"] = fy - scale * ref[1]
+                # 全体グリッドは変換に追従するため update 中は何もしない。
+                # 表示切替は interaction_end で1回だけ行う。
+            else:
+                # パン系: 焦点の移動量だけ平行移動（Flutter のパン処理と
+                # 同じ差分方式）。絶対座標の差分なので、間にホイールが
+                # 割り込んでも誤差が蓄積しない
+                state["tx"] += fx - prev[0]
+                state["ty"] += fy - prev[1]
+                state["gesture_was_pan"] = True
+            state["gesture_prev_focal"] = (fx, fy)
+
+        def on_interaction_end(e):
+            # 基準点は消さない（ドラッグ中にホイールの end が割り込んでも
+            # 続きのドラッグ更新を処理できるようにするため）。
+            # パン終了時に速度が 50px/s 以上あると Flutter は慣性
+            # アニメーションを行うが、その間 update イベントは届かない。
+            # 終端位置は FrictionSimulation の解析解
+            # （移動量 = 速度 / |ln(摩擦係数)|）で確定するため、
+            # ここで先取りして追跡へ反映する。
+            if state.get("gesture_was_pan"):
+                vx = float(e.velocity.x or 0.0)
+                vy = float(e.velocity.y or 0.0)
+                if math.hypot(vx, vy) >= 50.0:
+                    state["tx"] += vx / FLING_LOG
+                    state["ty"] += vy / FLING_LOG
+            self.page.run_task(sync_grid_deferred)
+
+        def toggle_grid(_e):
+            state["grid_enabled"] = not state["grid_enabled"]
+            if grid_toggle_btn_ref.current:
+                grid_toggle_btn_ref.current.icon = (
+                    ft.Icons.GRID_ON
+                    if state["grid_enabled"]
+                    else ft.Icons.GRID_OFF
+                )
+                grid_toggle_btn_ref.current.tooltip = (
+                    "ピクセルグリッドを非表示"
+                    if state["grid_enabled"]
+                    else "ピクセルグリッドを表示"
+                )
+            if state["grid_enabled"]:
+                sync_grid()
+            else:
+                hide_grid_now()
+            self.page.update()
+
+        def set_grid_spacing(spacing: int):
+            state["grid_spacing"] = spacing
+            state["grid_drawn"] = None
+            if grid_spacing_text_ref.current:
+                grid_spacing_text_ref.current.value = f"{spacing}px"
+            if state["grid_enabled"]:
+                sync_grid()
+            else:
+                hide_grid_now()
+            self.page.update()
+
+        def grid_spacing_menu_items() -> list[ft.PopupMenuItem]:
+            items: list[ft.PopupMenuItem] = []
+
+            def make_handler(selected: int):
+                def handler(_e):
+                    set_grid_spacing(selected)
+                return handler
+
+            for option in VIEWER_GRID_SPACING_OPTIONS:
+                items.append(
+                    ft.PopupMenuItem(
+                        content=f"{option}px",
+                        on_click=make_handler(option),
+                    )
+                )
+            return items
 
         def apply_layout():
             fullscreen = state["fullscreen"]
@@ -843,8 +1613,12 @@ class TaskImageSaverApp:
                 )
             if panel_ref.current:
                 panel_ref.current.expand = fullscreen
-                panel_ref.current.width = None if fullscreen else 900
-                panel_ref.current.height = None if fullscreen else 700
+                panel_ref.current.width = (
+                    None if fullscreen else VIEWER_PANEL_WIDTH
+                )
+                panel_ref.current.height = (
+                    None if fullscreen else VIEWER_PANEL_HEIGHT
+                )
                 panel_ref.current.bgcolor = (
                     ft.Colors.BLACK if fullscreen else ft.Colors.WHITE
                 )
@@ -852,13 +1626,8 @@ class TaskImageSaverApp:
                 panel_ref.current.padding = (
                     ft.Padding.all(0)
                     if fullscreen
-                    else ft.Padding.all(8)
+                    else ft.Padding.all(VIEWER_PANEL_PADDING)
                 )
-            if viewer_area_ref.current:
-                viewer_area_ref.current.top = 0 if fullscreen else 44
-                viewer_area_ref.current.bottom = 76 if fullscreen else 108
-                viewer_area_ref.current.left = 0
-                viewer_area_ref.current.right = 0
             if header_ref.current:
                 header_ref.current.visible = not fullscreen
             if footer_ref.current:
@@ -886,31 +1655,90 @@ class TaskImageSaverApp:
                     "全画面を終了" if fullscreen else "全画面表示"
                 )
             self.page.window.full_screen = fullscreen
-            reset_zoom()
             self.page.update()
+            self.page.run_task(refit_after_layout)
+
+        async def refit_after_layout():
+            await apply_fit_async(wait_layout=True)
 
         def toggle_fullscreen(_e):
             state["fullscreen"] = not state["fullscreen"]
             apply_layout()
 
-        def update_view():
-            i = state["idx"]
-            old_tmp = state.get("tmp")
-            new_tmp = self._save_large_image_to_temp(i)
-            if new_tmp and img_ref.current:
-                img_ref.current.src = new_tmp
-                state["tmp"] = new_tmp
-            if counter_ref.current:
-                counter_ref.current.value = f"{i + 1} / {len(bmp_paths)}"
-            if name_ref.current:
-                name_ref.current.value = os.path.basename(bmp_paths[i])
-            reset_zoom()
+        async def load_current_image_async():
+            generation = state["load_generation"]
+            idx = state["idx"]
+            if idx < 0 or idx >= len(bmp_paths):
+                return
+
+            clear_grid_cache()
+            if loading_ref.current:
+                loading_ref.current.visible = True
+            if img_ref.current:
+                img_ref.current.visible = False
             self.page.update()
-            if old_tmp and old_tmp != new_tmp:
-                try:
-                    os.remove(old_tmp)
-                except OSError:
-                    pass
+
+            try:
+                if self._preview_source == "zip":
+                    asset = await asyncio.to_thread(
+                        extract_viewer_bmp_from_zip,
+                        self._preview_zip_path,
+                        bmp_paths[idx],
+                    )
+                else:
+                    asset = await asyncio.to_thread(
+                        extract_viewer_bmp_from_path,
+                        bmp_paths[idx],
+                    )
+
+                if generation != state["load_generation"]:
+                    if asset:
+                        self._remove_temp_file(asset.temp_path)
+                    return
+
+                if not asset:
+                    return
+
+                old_bmp = state.get("bmp_tmp")
+                size_changed = (
+                    (state["width"], state["height"])
+                    != (asset.width, asset.height)
+                )
+                state["bmp_tmp"] = asset.temp_path
+                state["width"] = asset.width
+                state["height"] = asset.height
+
+                if stack_ref.current:
+                    stack_ref.current.width = asset.width
+                    stack_ref.current.height = asset.height
+                if img_ref.current:
+                    img_ref.current.width = asset.width
+                    img_ref.current.height = asset.height
+                    img_ref.current.src = asset.temp_path
+                    img_ref.current.visible = True
+                if size_changed and grid_canvas_ref.current:
+                    grid_canvas_ref.current.width = asset.width
+                    grid_canvas_ref.current.height = asset.height
+
+                if counter_ref.current:
+                    counter_ref.current.value = f"{idx + 1} / {len(bmp_paths)}"
+                if name_ref.current:
+                    name_ref.current.value = os.path.basename(bmp_paths[idx])
+
+                if old_bmp and old_bmp != asset.temp_path:
+                    self._remove_temp_file(old_bmp)
+
+                self.page.update()
+                await apply_fit_async()
+                self.page.update()
+            finally:
+                if loading_ref.current:
+                    loading_ref.current.visible = False
+                    loading_ref.current.update()
+
+        def update_view():
+            state["load_generation"] += 1
+            self.page.run_task(load_current_image_async)
 
         def on_prev(_e):
             state["idx"] = (state["idx"] - 1) % len(bmp_paths)
@@ -921,15 +1749,12 @@ class TaskImageSaverApp:
             update_view()
 
         def cleanup():
+            state["load_generation"] += 1
+            clear_grid_cache()
             self.page.window.full_screen = state["prev_window_full_screen"]
             if overlay in self.page.overlay:
                 self.page.overlay.remove(overlay)
-            tmp = state.get("tmp")
-            if tmp:
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
+            cleanup_viewer_temps()
             self.page.update()
 
         def on_close(_e=None):
@@ -939,47 +1764,29 @@ class TaskImageSaverApp:
         overlay = ft.Container(
             ref=overlay_ref,
             expand=True,
-            alignment=ft.Alignment(0, 0),
             bgcolor=ft.Colors.with_opacity(0.45, ft.Colors.BLACK),
-            content=ft.Container(
-                ref=panel_ref,
-                width=900,
-                height=700,
-                bgcolor=ft.Colors.WHITE,
-                border_radius=8,
-                padding=8,
-                clip_behavior=ft.ClipBehavior.HARD_EDGE,
-                content=ft.Stack(
-                    expand=True,
-                    controls=[
-                        ft.Container(
-                            ref=viewer_area_ref,
-                            left=0,
-                            right=0,
-                            top=44,
-                            bottom=108,
-                            clip_behavior=ft.ClipBehavior.HARD_EDGE,
-                            content=ft.InteractiveViewer(
-                                ref=viewer_ref,
-                                expand=True,
-                                min_scale=0.5,
-                                max_scale=8,
-                                trackpad_scroll_causes_scale=True,
-                                content=ft.Image(
-                                    ref=img_ref,
-                                    src=tmp_path,
-                                    fit=ft.BoxFit.CONTAIN,
-                                    expand=True,
-                                ),
-                            ),
-                        ),
-                        ft.Container(
-                            ref=header_ref,
-                            top=0,
-                            left=0,
-                            right=0,
-                            bgcolor=ft.Colors.WHITE,
-                            content=ft.Row(
+            content=ft.Stack(
+                expand=True,
+                alignment=ft.Alignment(0, 0),
+                controls=[
+                    ft.Container(
+                        ref=panel_ref,
+                        width=VIEWER_PANEL_WIDTH,
+                        height=VIEWER_PANEL_HEIGHT,
+                        bgcolor=ft.Colors.WHITE,
+                        border_radius=8,
+                        padding=VIEWER_PANEL_PADDING,
+                        clip_behavior=ft.ClipBehavior.HARD_EDGE,
+                        content=ft.Column(
+                            expand=True,
+                            spacing=0,
+                            controls=[
+                                ft.Container(
+                                    ref=header_ref,
+                                    height=VIEWER_HEADER_HEIGHT,
+                                    bgcolor=ft.Colors.WHITE,
+                                    alignment=ft.Alignment(-1, 0),
+                                    content=ft.Row(
                                 alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                                 vertical_alignment=(
                                     ft.CrossAxisAlignment.CENTER
@@ -1010,10 +1817,105 @@ class TaskImageSaverApp:
                             ),
                         ),
                         ft.Container(
+                            ref=viewer_area_ref,
+                            expand=True,
+                            clip_behavior=ft.ClipBehavior.HARD_EDGE,
+                            content=ft.Stack(
+                                expand=True,
+                                controls=[
+                                    # NOTE: alignment は Flet 0.85 クライアントの
+                                    # デシリアライズ不具合でグレー画面になるため
+                                    # 使用しない（中央寄せは pan() で行う）
+                                    ft.InteractiveViewer(
+                                        ref=viewer_ref,
+                                        expand=True,
+                                        constrained=False,
+                                        min_scale=VIEWER_MIN_SCALE,
+                                        max_scale=VIEWER_MAX_SCALE,
+                                        boundary_margin=ft.Margin.all(
+                                            100000,
+                                        ),
+                                        # -1 = 全ての更新イベントを受信する。
+                                        # クライアントの判定は
+                                        # 「now - 前回 > interval」のため 0 でも
+                                        # 同一ミリ秒内のイベントが破棄される。
+                                        # 高倍率時はフレームが長くなり複数の
+                                        # ホイールティックが同一ミリ秒内に処理
+                                        # されるので、間引かれると変換行列の
+                                        # 追跡がずれてグリッド位置を誤る。
+                                        interaction_update_interval=-1,
+                                        # パン後の慣性移動はイベント通知されず
+                                        # 変換追跡がずれるため、慣性を実質
+                                        # 無効化する。FrictionSimulation は
+                                        # 係数が小さいほど即停止する点に注意
+                                        # （0.01 はデフォルトの約2.4倍も
+                                        # 慣性が伸びる誤設定だった）
+                                        interaction_end_friction_coefficient=(
+                                            FLING_FRICTION
+                                        ),
+                                        trackpad_scroll_causes_scale=True,
+                                        on_interaction_start=on_interaction_start,
+                                        on_interaction_update=on_interaction_update,
+                                        on_interaction_end=on_interaction_end,
+                                        content=ft.Stack(
+                                            ref=stack_ref,
+                                            width=1,
+                                            height=1,
+                                            controls=[
+                                                ft.Image(
+                                                    ref=img_ref,
+                                                    src="",
+                                                    width=1,
+                                                    height=1,
+                                                    fit=ft.BoxFit.FILL,
+                                                    filter_quality=(
+                                                        ft.FilterQuality.NONE
+                                                    ),
+                                                    visible=False,
+                                                ),
+                                                cv.Canvas(
+                                                    ref=grid_canvas_ref,
+                                                    width=1,
+                                                    height=1,
+                                                    shapes=[],
+                                                    visible=False,
+                                                ),
+                                            ],
+                                        ),
+                                    ),
+                                    ft.Container(
+                                        ref=loading_ref,
+                                        expand=True,
+                                        visible=True,
+                                        bgcolor=ft.Colors.with_opacity(
+                                            0.65, ft.Colors.WHITE
+                                        ),
+                                        content=ft.Column(
+                                            [
+                                                ft.ProgressRing(
+                                                    width=28,
+                                                    height=28,
+                                                    stroke_width=3,
+                                                ),
+                                                ft.Text(
+                                                    "読み込み中...",
+                                                    size=12,
+                                                    color=ft.Colors.GREY_600,
+                                                ),
+                                            ],
+                                            alignment=ft.MainAxisAlignment.CENTER,
+                                            horizontal_alignment=(
+                                                ft.CrossAxisAlignment.CENTER
+                                            ),
+                                            spacing=10,
+                                        ),
+                                    ),
+                                ],
+                            ),
+                        ),
+                        ft.Container(
                             ref=footer_ref,
-                            left=0,
-                            right=0,
-                            bottom=0,
+                            height=VIEWER_FOOTER_HEIGHT,
                             bgcolor=ft.Colors.WHITE,
                             content=ft.Column(
                                 [
@@ -1024,73 +1926,134 @@ class TaskImageSaverApp:
                                         ),
                                         size=11,
                                         color=ft.Colors.GREY_700,
+                                        text_align=ft.TextAlign.CENTER,
                                     ),
-                                    ft.Row(
-                                        [
-                                            ft.IconButton(
-                                                icon=ft.Icons.ARROW_BACK,
-                                                tooltip="前の画像",
-                                                on_click=on_prev,
-                                                disabled=(total <= 1),
-                                            ),
-                                            ft.Text(
-                                                ref=counter_ref,
-                                                value=(
-                                                    f"{start_index + 1} / {total}"
+                                    ft.Container(
+                                        alignment=ft.Alignment(0, 0),
+                                        content=ft.Row(
+                                            [
+                                                ft.IconButton(
+                                                    icon=ft.Icons.ARROW_BACK,
+                                                    tooltip="前の画像",
+                                                    on_click=on_prev,
+                                                    disabled=(total <= 1),
                                                 ),
-                                                size=13,
-                                                weight=ft.FontWeight.W_500,
+                                                ft.Text(
+                                                    ref=counter_ref,
+                                                    value=(
+                                                        f"{start_index + 1} / {total}"
+                                                    ),
+                                                    size=13,
+                                                    weight=ft.FontWeight.W_500,
+                                                ),
+                                                ft.IconButton(
+                                                    icon=ft.Icons.ARROW_FORWARD,
+                                                    tooltip="次の画像",
+                                                    on_click=on_next,
+                                                    disabled=(total <= 1),
+                                                ),
+                                                ft.VerticalDivider(width=12),
+                                                ft.IconButton(
+                                                    icon=ft.Icons.ZOOM_OUT,
+                                                    tooltip="縮小",
+                                                    on_click=zoom_out_click,
+                                                ),
+                                                ft.IconButton(
+                                                    icon=ft.Icons.ZOOM_IN,
+                                                    tooltip="拡大",
+                                                    on_click=zoom_in_click,
+                                                ),
+                                                ft.IconButton(
+                                                    icon=ft.Icons.CROP_ORIGINAL,
+                                                    tooltip="等倍表示 (100%)",
+                                                    on_click=zoom_to_original_click,
+                                                ),
+                                                ft.IconButton(
+                                                    icon=ft.Icons.FIT_SCREEN,
+                                                    tooltip="全体表示にリセット",
+                                                    on_click=reset_zoom,
+                                                ),
+                                                ft.IconButton(
+                                                    ref=grid_toggle_btn_ref,
+                                                    icon=ft.Icons.GRID_ON,
+                                                    tooltip="ピクセルグリッドを非表示",
+                                                    on_click=toggle_grid,
+                                                ),
+                                                ft.PopupMenuButton(
+                                                    content=ft.Container(
+                                                        width=52,
+                                                        height=36,
+                                                        border=ft.Border.all(
+                                                            1, ft.Colors.GREY_400,
+                                                        ),
+                                                        border_radius=4,
+                                                        padding=ft.Padding.symmetric(
+                                                            horizontal=6,
+                                                        ),
+                                                        content=ft.Row(
+                                                            [
+                                                                ft.Text(
+                                                                    ref=grid_spacing_text_ref,
+                                                                    value=(
+                                                                        f"{DEFAULT_VIEWER_GRID_SPACING}px"
+                                                                    ),
+                                                                    size=12,
+                                                                ),
+                                                                ft.Icon(
+                                                                    ft.Icons.ARROW_DROP_DOWN,
+                                                                    size=16,
+                                                                    color=ft.Colors.GREY_700,
+                                                                ),
+                                                            ],
+                                                            alignment=(
+                                                                ft.MainAxisAlignment.SPACE_BETWEEN
+                                                            ),
+                                                            vertical_alignment=(
+                                                                ft.CrossAxisAlignment.CENTER
+                                                            ),
+                                                        ),
+                                                    ),
+                                                    tooltip="グリッド間隔",
+                                                    items=grid_spacing_menu_items(),
+                                                ),
+                                                ft.IconButton(
+                                                    icon=ft.Icons.FULLSCREEN,
+                                                    tooltip="全画面表示",
+                                                    on_click=toggle_fullscreen,
+                                                ),
+                                                ft.TextButton(
+                                                    "閉じる",
+                                                    on_click=on_close,
+                                                ),
+                                            ],
+                                            alignment=(
+                                                ft.MainAxisAlignment.CENTER
                                             ),
-                                            ft.IconButton(
-                                                icon=ft.Icons.ARROW_FORWARD,
-                                                tooltip="次の画像",
-                                                on_click=on_next,
-                                                disabled=(total <= 1),
+                                            run_alignment=(
+                                                ft.MainAxisAlignment.CENTER
                                             ),
-                                            ft.VerticalDivider(width=12),
-                                            ft.IconButton(
-                                                icon=ft.Icons.ZOOM_OUT,
-                                                tooltip="縮小",
-                                                on_click=zoom_out,
-                                            ),
-                                            ft.IconButton(
-                                                icon=ft.Icons.ZOOM_IN,
-                                                tooltip="拡大",
-                                                on_click=zoom_in,
-                                            ),
-                                            ft.IconButton(
-                                                icon=ft.Icons.FIT_SCREEN,
-                                                tooltip="表示をリセット",
-                                                on_click=lambda _e: reset_zoom(),
-                                            ),
-                                            ft.IconButton(
-                                                icon=ft.Icons.FULLSCREEN,
-                                                tooltip="全画面表示",
-                                                on_click=toggle_fullscreen,
-                                            ),
-                                            ft.TextButton(
-                                                "閉じる",
-                                                on_click=on_close,
-                                            ),
-                                        ],
-                                        alignment=ft.MainAxisAlignment.CENTER,
-                                        wrap=True,
+                                            wrap=True,
+                                        ),
                                     ),
                                 ],
                                 horizontal_alignment=(
-                                    ft.CrossAxisAlignment.CENTER
+                                    ft.CrossAxisAlignment.STRETCH
                                 ),
-                                spacing=4,
+                                alignment=ft.MainAxisAlignment.CENTER,
+                                spacing=2,
                             ),
                         ),
                     ],
                 ),
+                    ),
+                ],
             ),
         )
 
         self._image_viewer_cleanup = cleanup
         self.page.overlay.append(overlay)
         self.page.update()
+        self.page.run_task(load_current_image_async)
 
     def _show_thumbnail_loading(self):
         """サムネイル領域にローディング表示をセットする"""
@@ -1107,53 +2070,8 @@ class TaskImageSaverApp:
             ], spacing=8, alignment=ft.MainAxisAlignment.CENTER)
         )
 
-    def _load_file_thumbnails(self, file_path):
-        """選択されたタスクファイルの代表画像サムネイルを読み込んで表示"""
-        result = load_task_file_preview(
-            file_path,
-            self._option2_selected_task_prefix,
-            self._current_preview_limit(),
-            (160, 160),
-        )
-        self._apply_task_preview_result(file_path, result)
-
     def _is_multi_task_file(self) -> bool:
         return len(self._option2_task_folders) > 1
-
-    def _update_thumbnail_display(self):
-        """サムネイル行コントロールを現在のキャッシュで更新する"""
-        row = self.thumbnail_row.current
-        info = self.thumbnail_info.current
-        if not row:
-            return
-
-        row.controls.clear()
-        if self._file_thumbnails:
-            row.alignment = ft.MainAxisAlignment.START
-            for i, img_bytes in enumerate(self._file_thumbnails):
-                row.controls.append(
-                    self._build_option2_thumbnail_tile(img_bytes, i)
-                )
-        else:
-            row.alignment = ft.MainAxisAlignment.CENTER
-            if self._file_thumbnail_count == 0:
-                row.controls.append(
-                    ft.Text("画像が見つかりませんでした",
-                            size=11, color=ft.Colors.GREY_400, italic=True)
-                )
-
-        if info:
-            shown = len(self._file_thumbnails)
-            meta = self._format_option2_meta_summary()
-            if self._file_thumbnail_count > 0:
-                info.value = (
-                    f"{self._file_thumbnail_count}枚検出 / 表示{shown}枚"
-                    f" · クリックで拡大（ズーム/全画面可）"
-                )
-                if meta:
-                    info.value += f" · {meta}"
-            else:
-                info.value = "画像プレビュー"
 
     def _pick_option3_folder(self, e):
         async def _run():
@@ -1162,6 +2080,7 @@ class TaskImageSaverApp:
                 self.option3_folder_field.current.value = folder
                 self.config_manager.set("option3_folder", folder)
                 self.config_manager.save()
+                self._update_load_task_list_button()
                 self.page.update()
 
         self.page.run_task(_run)
@@ -1184,6 +2103,11 @@ class TaskImageSaverApp:
         self._option2_task_folders = []
         self._option2_selected_task_prefix = None
         self._option2_save_task_prefixes = set()
+        self._local_task_folders = []
+        self._local_selected_task_prefix = None
+        self._preview_source = "zip"
+        self._preview_img_folder = ""
+        self._local_task_list_loading = False
         self._current_task_save_jobs = []
         self._current_cleanup_paths = []
 
@@ -1197,11 +2121,20 @@ class TaskImageSaverApp:
         elif option == "option3":
             self.dynamic_content.current.controls.extend(
                 self._build_option3_fields())
+        if self.preview_limit_menu.current:
+            if option == "option2":
+                file_path = (
+                    self.file_path.current.value
+                    if self.file_path.current else ""
+                )
+                self.preview_limit_menu.current.disabled = not file_path
+            else:
+                self.preview_limit_menu.current.disabled = True
         self.page.update()
 
-    def _build_group_task_fields(self):
+    def _build_group_task_fields(self, *, include_preview: bool = True):
         """グループ番号・タスク番号入力フィールドを生成"""
-        return [
+        fields = [
             ft.Row([
                 ft.Text("グループ番号:", width=100, size=14),
                 ft.TextField(
@@ -1223,6 +2156,9 @@ class TaskImageSaverApp:
                 ft.Container(width=93),
             ]),
         ]
+        if include_preview:
+            fields.extend(self._build_local_task_preview_section())
+        return fields
 
     _BROWSE_BUTTON_WIDTH = 96
 
@@ -1305,7 +2241,7 @@ class TaskImageSaverApp:
             ft.Container(height=PREVIEW_LIMIT_ROW_BOTTOM_GAP),
         ]
 
-    def _build_option2_thumbnail_tile(self, img_bytes: bytes, index: int):
+    def _build_thumbnail_tile(self, img_bytes: bytes, index: int):
         """プレビュー用サムネイル1枚分の UI。"""
         thumb_px = 112
         label = ""
@@ -1339,17 +2275,17 @@ class TaskImageSaverApp:
             ], spacing=2, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
         )
 
-    def _build_option2_fields(self):
+    def _build_thumbnail_panel_content(self, empty_message: str) -> tuple[list, str]:
         thumbnail_controls = []
         if self._file_thumbnails:
             for i, img_bytes in enumerate(self._file_thumbnails):
                 thumbnail_controls.append(
-                    self._build_option2_thumbnail_tile(img_bytes, i)
+                    self._build_thumbnail_tile(img_bytes, i)
                 )
         else:
             thumbnail_controls.append(
                 ft.Text(
-                    "ファイルを選択するとプレビューが表示されます",
+                    empty_message,
                     size=11,
                     color=ft.Colors.GREY_400,
                     italic=True,
@@ -1366,145 +2302,206 @@ class TaskImageSaverApp:
             meta = self._format_option2_meta_summary()
             if meta:
                 info_text += f" · {meta}"
+        return thumbnail_controls, info_text
 
+    def _build_task_preview_workspace(
+        self,
+        *,
+        show_save_controls: bool,
+        task_list_ref: ft.Ref[ft.Column],
+        workspace_ref: ft.Ref[ft.Container],
+        empty_message: str,
+        list_placeholder: str,
+    ) -> ft.Container:
+        thumbnail_controls, info_text = self._build_thumbnail_panel_content(
+            empty_message,
+        )
         panel_border = ft.Border.all(1, ft.Colors.GREY_200)
         panel_radius = 6
 
+        left_controls: list[ft.Control] = [
+            ft.Text(
+                (
+                    "保存対象タスク（行クリックでプレビュー切替）"
+                    if show_save_controls
+                    else "タスク一覧（行クリックでプレビュー切替）"
+                ),
+                size=11,
+                weight=ft.FontWeight.W_500,
+            ),
+            *self._build_preview_limit_row(),
+        ]
+
+        if show_save_controls:
+            left_controls.extend([
+                ft.Container(
+                    height=26,
+                    content=ft.RadioGroup(
+                        ref=self.option2_save_mode_radio,
+                        value="all",
+                        on_change=self._on_option2_save_mode_changed,
+                        content=ft.Row([
+                            ft.Radio(
+                                value="all",
+                                label="全タスク",
+                                label_style=ft.TextStyle(size=11),
+                                visual_density=ft.VisualDensity.COMPACT,
+                            ),
+                            ft.Radio(
+                                value="selected",
+                                label="選択のみ",
+                                label_style=ft.TextStyle(size=11),
+                                visual_density=ft.VisualDensity.COMPACT,
+                            ),
+                        ], spacing=4, tight=True),
+                    ),
+                ),
+                ft.Row([
+                    ft.TextButton(
+                        "全選択",
+                        ref=self.option2_select_all_btn,
+                        disabled=True,
+                        style=ft.ButtonStyle(
+                            padding=ft.Padding.all(4)),
+                        on_click=lambda e:
+                            self._set_option2_group_task_checked(True)),
+                    ft.TextButton(
+                        "全解除",
+                        ref=self.option2_deselect_all_btn,
+                        disabled=True,
+                        style=ft.ButtonStyle(
+                            padding=ft.Padding.all(4)),
+                        on_click=lambda e:
+                            self._set_option2_group_task_checked(False)),
+                    ft.Text(
+                        ref=self.option2_save_selection_info,
+                        value="",
+                        size=10,
+                        color=ft.Colors.GREY_700,
+                        expand=True,
+                    ),
+                ], spacing=0),
+            ])
+        else:
+            left_controls.append(
+                ft.ElevatedButton(
+                    LOAD_TASK_LIST_BUTTON_LABEL,
+                    ref=self.load_task_list_btn,
+                    icon=ft.Icons.REFRESH,
+                    on_click=self._on_load_task_list_click,
+                    disabled=not self._is_load_task_list_enabled(),
+                )
+            )
+
+        left_controls.append(
+            ft.Container(
+                expand=True,
+                content=ft.Column(
+                    ref=task_list_ref,
+                    controls=[
+                        ft.Text(
+                            list_placeholder,
+                            size=11,
+                            color=ft.Colors.GREY_500,
+                        )
+                    ],
+                    spacing=2,
+                    scroll=ft.ScrollMode.AUTO,
+                ),
+            )
+        )
+
+        return ft.Container(
+            ref=workspace_ref,
+            expand=True,
+            padding=ft.Padding.only(top=4),
+            content=ft.Row(
+                [
+                    ft.Container(
+                        width=300,
+                        expand=2,
+                        padding=8,
+                        border=panel_border,
+                        border_radius=panel_radius,
+                        bgcolor=ft.Colors.GREY_50,
+                        content=ft.Column(
+                            left_controls,
+                            spacing=6,
+                            expand=True,
+                        ),
+                    ),
+                    ft.Container(
+                        expand=3,
+                        padding=8,
+                        border=panel_border,
+                        border_radius=panel_radius,
+                        bgcolor=ft.Colors.GREY_50,
+                        content=ft.Column([
+                            ft.Text(
+                                ref=self.thumbnail_info,
+                                value=info_text,
+                                size=11,
+                                color=ft.Colors.GREY_700,
+                            ),
+                            ft.Container(
+                                expand=True,
+                                content=ft.Column(
+                                    scroll=ft.ScrollMode.AUTO,
+                                    controls=[
+                                        ft.Row(
+                                            ref=self.thumbnail_row,
+                                            controls=thumbnail_controls,
+                                            spacing=6,
+                                            wrap=True,
+                                            run_spacing=6,
+                                            alignment=(
+                                                ft.MainAxisAlignment.CENTER
+                                                if not self._file_thumbnails
+                                                else ft.MainAxisAlignment.START
+                                            ),
+                                        ),
+                                    ],
+                                ),
+                            ),
+                        ], spacing=4, expand=True),
+                    ),
+                ],
+                expand=True,
+                spacing=8,
+                vertical_alignment=ft.CrossAxisAlignment.STRETCH,
+            ),
+        )
+
+    def _build_option2_fields(self):
         return [
             self._build_browse_row(
                 self.file_path,
                 "タスクファイル (.ziq 等)",
                 self._pick_file,
             ),
-            ft.Container(
-                ref=self.option2_workspace,
-                expand=True,
-                padding=ft.Padding.only(top=4),
-                content=ft.Row(
-                    [
-                        ft.Container(
-                            width=300,
-                            expand=2,
-                            padding=8,
-                            border=panel_border,
-                            border_radius=panel_radius,
-                            bgcolor=ft.Colors.GREY_50,
-                            content=ft.Column([
-                                ft.Text(
-                                    "保存対象タスク（行クリックでプレビュー切替）",
-                                    size=11,
-                                    weight=ft.FontWeight.W_500,
-                                ),
-                                *self._build_preview_limit_row(),
-                                ft.Container(
-                                    height=26,
-                                    content=ft.RadioGroup(
-                                        ref=self.option2_save_mode_radio,
-                                        value="all",
-                                        on_change=self._on_option2_save_mode_changed,
-                                        content=ft.Row([
-                                            ft.Radio(
-                                                value="all",
-                                                label="全タスク",
-                                                label_style=ft.TextStyle(size=11),
-                                                visual_density=ft.VisualDensity.COMPACT,
-                                            ),
-                                            ft.Radio(
-                                                value="selected",
-                                                label="選択のみ",
-                                                label_style=ft.TextStyle(size=11),
-                                                visual_density=ft.VisualDensity.COMPACT,
-                                            ),
-                                        ], spacing=4, tight=True),
-                                    ),
-                                ),
-                                ft.Row([
-                                    ft.TextButton(
-                                        "全選択",
-                                        ref=self.option2_select_all_btn,
-                                        disabled=True,
-                                        style=ft.ButtonStyle(
-                                            padding=ft.Padding.all(4)),
-                                        on_click=lambda e:
-                                            self._set_option2_group_task_checked(True)),
-                                    ft.TextButton(
-                                        "全解除",
-                                        ref=self.option2_deselect_all_btn,
-                                        disabled=True,
-                                        style=ft.ButtonStyle(
-                                            padding=ft.Padding.all(4)),
-                                        on_click=lambda e:
-                                            self._set_option2_group_task_checked(False)),
-                                    ft.Text(
-                                        ref=self.option2_save_selection_info,
-                                        value="",
-                                        size=10,
-                                        color=ft.Colors.GREY_700,
-                                        expand=True,
-                                    ),
-                                ], spacing=0),
-                                ft.Container(
-                                    expand=True,
-                                    content=ft.Column(
-                                        ref=self.option2_task_selection_column,
-                                        controls=[
-                                            ft.Text(
-                                                "タスクファイルを選択してください。",
-                                                size=11,
-                                                color=ft.Colors.GREY_500,
-                                            )
-                                        ],
-                                        spacing=2,
-                                        scroll=ft.ScrollMode.AUTO,
-                                    ),
-                                ),
-                            ], spacing=6, expand=True),
-                        ),
-                        ft.Container(
-                            expand=3,
-                            padding=8,
-                            border=panel_border,
-                            border_radius=panel_radius,
-                            bgcolor=ft.Colors.GREY_50,
-                            content=ft.Column([
-                                ft.Text(
-                                    ref=self.thumbnail_info,
-                                    value=info_text,
-                                    size=11,
-                                    color=ft.Colors.GREY_700,
-                                ),
-                                ft.Container(
-                                    expand=True,
-                                    content=ft.Column(
-                                        scroll=ft.ScrollMode.AUTO,
-                                        controls=[
-                                            ft.Row(
-                                                ref=self.thumbnail_row,
-                                                controls=thumbnail_controls,
-                                                spacing=6,
-                                                wrap=True,
-                                                run_spacing=6,
-                                                alignment=(
-                                                    ft.MainAxisAlignment.CENTER
-                                                    if not self._file_thumbnails
-                                                    else ft.MainAxisAlignment.START
-                                                ),
-                                            ),
-                                        ],
-                                    ),
-                                ),
-                            ], spacing=4, expand=True),
-                        ),
-                    ],
-                    expand=True,
-                    spacing=8,
-                    vertical_alignment=ft.CrossAxisAlignment.STRETCH,
-                ),
+            self._build_task_preview_workspace(
+                show_save_controls=True,
+                task_list_ref=self.option2_task_selection_column,
+                workspace_ref=self.option2_workspace,
+                empty_message="ファイルを選択するとプレビューが表示されます",
+                list_placeholder="タスクファイルを選択してください。",
+            ),
+        ]
+
+    def _build_local_task_preview_section(self):
+        return [
+            ft.Container(height=5),
+            self._build_task_preview_workspace(
+                show_save_controls=False,
+                task_list_ref=self.local_task_selection_column,
+                workspace_ref=self.local_task_workspace,
+                empty_message=LOCAL_TASK_LIST_PLACEHOLDER,
+                list_placeholder=LOCAL_TASK_LIST_PLACEHOLDER,
             ),
         ]
 
     def _build_option3_fields(self):
-        fields = self._build_group_task_fields()
+        fields = self._build_group_task_fields(include_preview=False)
         fields.extend([
             ft.Container(height=5),
             ft.Text("共有VTVフォルダ選択:", size=14),
@@ -1522,6 +2519,7 @@ class TaskImageSaverApp:
                     on_click=self._pick_option3_folder),
             ]),
         ])
+        fields.extend(self._build_local_task_preview_section())
         return fields
 
     # ==================================================================
