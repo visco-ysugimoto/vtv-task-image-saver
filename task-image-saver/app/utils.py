@@ -235,6 +235,7 @@ def _format_info_file_mtime(info_path: str) -> str:
 
 
 TASK_LIST_DAT_FILENAME = "taskList.dat"
+TASK_LIST_BLOCK_SIZE = 50
 _PLACEHOLDER_TASK_TITLES = frozenset({"未登録", ""})
 
 
@@ -250,6 +251,11 @@ def _folder_group_task_ids(task_dir: str) -> tuple[int, int, str]:
     group_num = int(re.sub(r"^g", "", group_name, flags=re.IGNORECASE))
     task_num = int(task_name)
     return group_num, task_num, task_name
+
+
+def _task_list_data_line_index(group_num: int, task_num: int) -> int:
+    """taskList.dat 内のデータ行インデックス(0-based)を返す。"""
+    return 1 + (group_num - 1) * TASK_LIST_BLOCK_SIZE + (task_num - 1)
 
 
 def _is_usable_task_title(title: Optional[str]) -> bool:
@@ -299,7 +305,11 @@ def _latest_image_mtime(img_dir: str) -> str:
 def load_task_list_dat_index(
     viscotech_root: str,
 ) -> dict[tuple[int, int], tuple[str, str, str]]:
-    """taskList.dat を (group_num, task_num) キーの辞書に読み込む。"""
+    """taskList.dat を (group_num, task_num) キーの辞書に読み込む。
+
+    taskList.dat はヘッダー1行の後、グループごとに50行(タスク01〜50)の
+    固定ブロック構造。g02/01 は 2番目のブロック先頭行に対応する。
+    """
     path = os.path.join(viscotech_root, TASK_LIST_DAT_FILENAME)
     if not os.path.isfile(path):
         return {}
@@ -317,23 +327,26 @@ def load_task_list_dat_index(
         if len(lines) < 2:
             continue
         header_line = lines[0]
-        for data_line in lines[1:]:
-            parts = data_line.split(",")
-            if len(parts) < 5:
-                continue
-            try:
-                task_num = int(parts[1].strip())
-                group_num = int(parts[2].strip())
-            except ValueError:
-                continue
-            title, comment, updated_at = parse_task_info_txt(
-                f"{header_line}\n{data_line}",
-            )
-            index[(group_num, task_num)] = (
-                title or "",
-                comment or "",
-                updated_at or "",
-            )
+        data_line_count = len(lines) - 1
+        max_group = (
+            (data_line_count + TASK_LIST_BLOCK_SIZE - 1) // TASK_LIST_BLOCK_SIZE
+        )
+        for group_num in range(1, max_group + 1):
+            for task_num in range(1, TASK_LIST_BLOCK_SIZE + 1):
+                line_idx = _task_list_data_line_index(group_num, task_num)
+                if line_idx >= len(lines):
+                    break
+                data_line = lines[line_idx]
+                if not data_line:
+                    continue
+                title, comment, updated_at = parse_task_info_txt(
+                    f"{header_line}\n{data_line}",
+                )
+                index[(group_num, task_num)] = (
+                    title or "",
+                    comment or "",
+                    updated_at or "",
+                )
         if index:
             return index
     return index
