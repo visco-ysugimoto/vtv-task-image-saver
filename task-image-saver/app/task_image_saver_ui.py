@@ -77,6 +77,7 @@ from task_image_saver_logic import (
 from utils import (
     TASK_FILE_EXTENSIONS_LABEL,
     TaskFolder,
+    TaskImageSource,
     format_value,
     is_task_file_path,
     list_task_folders_with_metadata,
@@ -119,8 +120,11 @@ class TaskImageSaverApp:
         self._local_selected_task_prefix: str | None = None
         self._preview_source: Literal["zip", "folder"] = "zip"
         self._preview_img_folder = ""
+        self._preview_image_sources: list[TaskImageSource] = []
+        self._preview_txt_name = ""
         self._local_task_list_loading = False
         self._local_preview_generation = 0
+        self._option2_preview_generation = 0
         self._launch_task_file = (
             launch_task_file if launch_task_file and is_task_file_path(launch_task_file)
             else None
@@ -158,6 +162,11 @@ class TaskImageSaverApp:
         self.thumbnail_info = ft.Ref[ft.Text]()
         self.preview_limit_menu = ft.Ref[ft.PopupMenuButton]()
         self.preview_limit_value_text = ft.Ref[ft.Text]()
+        self.preview_txt_row = ft.Ref[ft.Container]()
+        self.preview_txt_menu = ft.Ref[ft.PopupMenuButton]()
+        self.preview_txt_value_text = ft.Ref[ft.Text]()
+        self.preview_txt_prev_btn = ft.Ref[ft.IconButton]()
+        self.preview_txt_next_btn = ft.Ref[ft.IconButton]()
         self.option2_workspace = ft.Ref[ft.Container]()
         self.local_task_selection_column = ft.Ref[ft.Column]()
         self.local_task_workspace = ft.Ref[ft.Container]()
@@ -452,6 +461,8 @@ class TaskImageSaverApp:
             self.file_path.current.value = file_path
         if self.warning_text.current:
             self.warning_text.current.value = ""
+        self._preview_txt_name = ""
+        self._preview_image_sources = []
         self._show_thumbnail_loading()
         row = self.thumbnail_row.current
         if row:
@@ -673,6 +684,8 @@ class TaskImageSaverApp:
         if not selected:
             return
 
+        if selected.prefix != self._local_selected_task_prefix:
+            self._preview_txt_name = ""
         self._local_preview_generation += 1
         generation = self._local_preview_generation
         self._local_selected_task_prefix = selected.prefix
@@ -691,6 +704,7 @@ class TaskImageSaverApp:
             selected.prefix,
             max_images,
             (160, 160),
+            self._preview_txt_name or None,
         )
         if generation != self._local_preview_generation:
             return
@@ -774,6 +788,8 @@ class TaskImageSaverApp:
         self._preview_bmp_names = result.thumbnail_paths
         self._option2_all_bmp_paths = result.all_bmp_paths
         self._option2_task_metadata = result.metadata
+        self._preview_image_sources = result.image_sources or []
+        self._preview_txt_name = result.selected_txt_name or ""
         self._preview_source = preview_source
         if preview_source == "zip":
             self._preview_zip_path = source_path
@@ -860,9 +876,12 @@ class TaskImageSaverApp:
         else:
             row.alignment = ft.MainAxisAlignment.CENTER
             if self._file_thumbnail_count == 0:
+                empty_message = "画像が見つかりませんでした"
+                if len(self._preview_image_sources) > 1:
+                    empty_message = "この参照txtに記載された画像はありません"
                 row.controls.append(
                     ft.Text(
-                        "画像が見つかりませんでした",
+                        empty_message,
                         size=11,
                         color=ft.Colors.GREY_400,
                         italic=True,
@@ -872,13 +891,19 @@ class TaskImageSaverApp:
         if info:
             info.value = self._thumbnail_info_text()
         await asyncio.sleep(0)
+        self._update_preview_txt_selector()
+        txt_row = self.preview_txt_row.current
         if info:
             row.update()
             info.update()
         else:
             row.update()
+        if txt_row:
+            txt_row.update()
 
     async def _load_option2_preview_async(self, file_path: str) -> None:
+        self._option2_preview_generation += 1
+        generation = self._option2_preview_generation
         max_images = self._current_preview_limit()
         result = await asyncio.to_thread(
             load_task_file_preview,
@@ -886,7 +911,10 @@ class TaskImageSaverApp:
             self._option2_selected_task_prefix,
             max_images,
             (160, 160),
+            self._preview_txt_name or None,
         )
+        if generation != self._option2_preview_generation:
+            return
         self._apply_task_preview_result(
             result,
             preview_source="zip",
@@ -910,6 +938,100 @@ class TaskImageSaverApp:
                 )
             )
         return items
+
+    def _preview_txt_index(self) -> int:
+        name = (self._preview_txt_name or "").lower()
+        for i, source in enumerate(self._preview_image_sources):
+            if source.txt_name.lower() == name:
+                return i
+        return 0
+
+    @staticmethod
+    def _preview_txt_comment_label(source: TaskImageSource) -> str:
+        comment = save_task_images_CamNum_selection.normalize_comment(
+            source.comment
+        )
+        return comment or "コメントなし"
+
+    def _preview_txt_item_label(self, source: TaskImageSource) -> str:
+        title = self._preview_txt_comment_label(source)
+        count = len(source.bmp_paths)
+        return f"{title} ({count}枚)"
+
+    def _preview_txt_display_label(self, source: TaskImageSource, index: int) -> str:
+        total = len(self._preview_image_sources)
+        title = self._preview_txt_comment_label(source)
+        count = len(source.bmp_paths)
+        return f"{index + 1}/{total}  {title} ({count}枚)"
+
+    def _preview_txt_menu_items(self) -> list[ft.PopupMenuItem]:
+        items: list[ft.PopupMenuItem] = []
+
+        def make_handler(txt_name: str):
+            def handler(_e):
+                self._set_preview_txt_name(txt_name)
+            return handler
+
+        for source in self._preview_image_sources:
+            items.append(
+                ft.PopupMenuItem(
+                    content=self._preview_txt_item_label(source),
+                    on_click=make_handler(source.txt_name),
+                )
+            )
+        return items
+
+    def _set_preview_txt_name(self, txt_name: str) -> None:
+        if txt_name == self._preview_txt_name:
+            return
+        self._close_image_viewer()
+        self._preview_txt_name = txt_name
+        self._update_preview_txt_selector()
+        self.page.update()
+        self.page.run_task(self._reload_current_preview)
+
+    def _shift_preview_txt(self, delta: int) -> None:
+        sources = self._preview_image_sources
+        if len(sources) <= 1:
+            return
+        index = (self._preview_txt_index() + delta) % len(sources)
+        self._set_preview_txt_name(sources[index].txt_name)
+
+    def _update_preview_txt_selector(self) -> None:
+        sources = self._preview_image_sources
+        row = self.preview_txt_row.current
+        menu = self.preview_txt_menu.current
+        value_text = self.preview_txt_value_text.current
+        prev_btn = self.preview_txt_prev_btn.current
+        next_btn = self.preview_txt_next_btn.current
+        has_sources = bool(sources)
+        multiple = len(sources) > 1
+
+        if row:
+            row.visible = has_sources
+        if not has_sources:
+            if value_text:
+                value_text.value = ""
+            if menu:
+                menu.items = []
+                menu.disabled = True
+            if prev_btn:
+                prev_btn.disabled = True
+            if next_btn:
+                next_btn.disabled = True
+            return
+
+        index = self._preview_txt_index()
+        source = sources[index]
+        if value_text:
+            value_text.value = self._preview_txt_display_label(source, index)
+        if menu:
+            menu.items = self._preview_txt_menu_items()
+            menu.disabled = not multiple
+        if prev_btn:
+            prev_btn.disabled = not multiple
+        if next_btn:
+            next_btn.disabled = not multiple
 
     async def _reload_option2_preview(self):
         file_path = self.file_path.current.value if self.file_path.current else ""
@@ -1109,6 +1231,8 @@ class TaskImageSaverApp:
         )
         if not selected:
             return
+        if selected.prefix != self._option2_selected_task_prefix:
+            self._preview_txt_name = ""
         self._option2_selected_task_prefix = selected.prefix
         self._update_option2_save_task_controls()
         self._show_thumbnail_loading()
@@ -2107,6 +2231,8 @@ class TaskImageSaverApp:
         self._local_selected_task_prefix = None
         self._preview_source = "zip"
         self._preview_img_folder = ""
+        self._preview_image_sources = []
+        self._preview_txt_name = ""
         self._local_task_list_loading = False
         self._current_task_save_jobs = []
         self._current_cleanup_paths = []
@@ -2240,6 +2366,90 @@ class TaskImageSaverApp:
             ),
             ft.Container(height=PREVIEW_LIMIT_ROW_BOTTOM_GAP),
         ]
+
+    def _build_preview_txt_selector_row(self) -> ft.Control:
+        """参照 txt 切替（複数 txt があるタスクでサムネ対象を切り替える）。"""
+        sources = self._preview_image_sources
+        multiple = len(sources) > 1
+        index = self._preview_txt_index() if sources else 0
+        current_label = ""
+        if sources:
+            current_label = self._preview_txt_display_label(sources[index], index)
+
+        value_box = ft.Container(
+            expand=True,
+            height=PREVIEW_LIMIT_ROW_HEIGHT,
+            border=ft.Border.all(1, ft.Colors.GREY_400),
+            border_radius=4,
+            bgcolor=ft.Colors.WHITE,
+            padding=ft.Padding.symmetric(horizontal=8),
+            content=ft.Row(
+                [
+                    ft.Text(
+                        ref=self.preview_txt_value_text,
+                        value=current_label,
+                        size=PREVIEW_LIMIT_TEXT_SIZE,
+                        color=ft.Colors.GREY_900,
+                        overflow=ft.TextOverflow.ELLIPSIS,
+                        max_lines=1,
+                        expand=True,
+                    ),
+                    ft.Icon(
+                        ft.Icons.ARROW_DROP_DOWN,
+                        size=18,
+                        color=ft.Colors.GREY_700,
+                    ),
+                ],
+                spacing=4,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+        )
+        compact_style = ft.ButtonStyle(
+            padding=ft.Padding.all(0),
+            visual_density=ft.VisualDensity.COMPACT,
+        )
+        return ft.Container(
+            ref=self.preview_txt_row,
+            visible=bool(sources),
+            content=ft.Row(
+                [
+                    ft.Text(
+                        "参照txt",
+                        size=PREVIEW_LIMIT_TEXT_SIZE,
+                        color=ft.Colors.GREY_700,
+                    ),
+                    ft.IconButton(
+                        ref=self.preview_txt_prev_btn,
+                        icon=ft.Icons.CHEVRON_LEFT,
+                        tooltip="前の参照txt",
+                        icon_size=18,
+                        style=compact_style,
+                        disabled=not multiple,
+                        on_click=lambda _e: self._shift_preview_txt(-1),
+                    ),
+                    ft.Container(
+                        expand=True,
+                        content=ft.PopupMenuButton(
+                            ref=self.preview_txt_menu,
+                            content=value_box,
+                            items=self._preview_txt_menu_items(),
+                            disabled=not multiple,
+                        ),
+                    ),
+                    ft.IconButton(
+                        ref=self.preview_txt_next_btn,
+                        icon=ft.Icons.CHEVRON_RIGHT,
+                        tooltip="次の参照txt",
+                        icon_size=18,
+                        style=compact_style,
+                        disabled=not multiple,
+                        on_click=lambda _e: self._shift_preview_txt(1),
+                    ),
+                ],
+                spacing=4,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+        )
 
     def _build_thumbnail_tile(self, img_bytes: bytes, index: int):
         """プレビュー用サムネイル1枚分の UI。"""
@@ -2443,6 +2653,7 @@ class TaskImageSaverApp:
                                 size=11,
                                 color=ft.Colors.GREY_700,
                             ),
+                            self._build_preview_txt_selector_row(),
                             ft.Container(
                                 expand=True,
                                 content=ft.Column(

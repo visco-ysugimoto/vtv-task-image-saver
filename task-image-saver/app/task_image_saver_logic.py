@@ -11,7 +11,7 @@ import tempfile
 import traceback
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Optional
 
@@ -25,6 +25,7 @@ from security_limits import (
 )
 from utils import (
     TaskFolder,
+    TaskImageSource,
     TaskZipMetadata,
     convert_bmp_to_jpeg,
     extract_ordered_bmp_paths_from_folder,
@@ -32,9 +33,12 @@ from utils import (
     extract_task_file,
     extract_task_zip_metadata,
     list_task_folders_with_metadata,
+    list_task_image_sources_from_folder,
+    list_task_image_sources_from_zip,
     parse_task_version_text,
     pick_sample_paths,
     resolve_task_folder_metadata,
+    select_task_image_source,
 )
 
 ALLOWED_PLACEHOLDERS = {"comment", "tool", "original", "cam", "div", "index", "file"}
@@ -50,6 +54,8 @@ class TaskPreviewLoadResult:
     thumbnail_paths: list[str]
     all_bmp_paths: list[str]
     metadata: Optional[TaskZipMetadata] = None
+    image_sources: list[TaskImageSource] = field(default_factory=list)
+    selected_txt_name: str = ""
 
 
 @dataclass
@@ -225,21 +231,44 @@ def cleanup_extracted_task_folders(
             print(f"展開フォルダの削除に失敗しました: {cleanup_path} - {ex}")
 
 
+def _resolve_preview_source_bmps(
+    sources: list[TaskImageSource],
+    txt_name: Optional[str],
+    fallback_bmps: Callable[[], list[str]],
+) -> tuple[list[str], str]:
+    """選択した参照 txt の BMP 一覧を返す。txt が無い場合は fallback。"""
+    selected = select_task_image_source(sources, txt_name)
+    if selected is None:
+        return fallback_bmps(), ""
+    if selected.bmp_paths:
+        return selected.bmp_paths, selected.txt_name
+    if len(sources) <= 1:
+        return fallback_bmps(), selected.txt_name
+    return [], selected.txt_name
+
+
 def load_task_file_preview(
     zip_path: str,
     task_prefix: Optional[str] = None,
     max_images: Optional[int] = 12,
     thumb_size: tuple[int, int] = (160, 160),
+    txt_name: Optional[str] = None,
 ) -> TaskPreviewLoadResult:
     """タスクファイルからプレビュー用サムネイルと全 BMP 一覧を取得する。"""
     empty = TaskPreviewLoadResult(0, [], [], [], None)
     try:
-        all_bmps = extract_ordered_bmp_paths_from_zip(zip_path, task_prefix)
+        sources = list_task_image_sources_from_zip(zip_path, task_prefix)
+        all_bmps, selected_txt_name = _resolve_preview_source_bmps(
+            sources,
+            txt_name,
+            lambda: extract_ordered_bmp_paths_from_zip(zip_path, task_prefix),
+        )
         metadata = extract_task_zip_metadata(zip_path, task_prefix)
         selected = pick_sample_paths(all_bmps, max_images)
         if not selected:
             return TaskPreviewLoadResult(
                 len(all_bmps), [], [], all_bmps, metadata,
+                sources, selected_txt_name,
             )
 
         def _process_one_bmp(args):
@@ -273,6 +302,7 @@ def load_task_file_preview(
         paths = [r[1] for r in results if r is not None]
         return TaskPreviewLoadResult(
             len(all_bmps), thumbnails, paths, all_bmps, metadata,
+            sources, selected_txt_name,
         )
     except Exception as ex:
         print(f"プレビュー読み込みエラー: {ex}")
@@ -373,11 +403,17 @@ def load_folder_preview(
     task_dir: Optional[str] = None,
     max_images: Optional[int] = 12,
     thumb_size: tuple[int, int] = (160, 160),
+    txt_name: Optional[str] = None,
 ) -> TaskPreviewLoadResult:
     """img フォルダからプレビュー用サムネイルと全 BMP 一覧を取得する。"""
     empty = TaskPreviewLoadResult(0, [], [], [], None)
     try:
-        all_bmps = extract_ordered_bmp_paths_from_folder(img_folder)
+        sources = list_task_image_sources_from_folder(img_folder)
+        all_bmps, selected_txt_name = _resolve_preview_source_bmps(
+            sources,
+            txt_name,
+            lambda: extract_ordered_bmp_paths_from_folder(img_folder),
+        )
         metadata = (
             extract_task_folder_metadata(task_dir)
             if task_dir
@@ -387,6 +423,7 @@ def load_folder_preview(
         if not selected:
             return TaskPreviewLoadResult(
                 len(all_bmps), [], [], all_bmps, metadata,
+                sources, selected_txt_name,
             )
 
         def _process_one_bmp(args):
@@ -418,6 +455,7 @@ def load_folder_preview(
         paths = [r[1] for r in results if r is not None]
         return TaskPreviewLoadResult(
             len(all_bmps), thumbnails, paths, all_bmps, metadata,
+            sources, selected_txt_name,
         )
     except Exception as ex:
         print(f"フォルダプレビュー読み込みエラー: {ex}")

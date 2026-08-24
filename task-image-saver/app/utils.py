@@ -4,7 +4,7 @@
 import os
 import re
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Callable
@@ -53,6 +53,15 @@ class TaskZipMetadata:
     title: Optional[str] = None
     comment: Optional[str] = None
     last_updated: Optional[str] = None
+
+
+@dataclass
+class TaskImageSource:
+    """img フォルダ内の参照用 txt 1件と、そこに記載された BMP。"""
+
+    txt_name: str
+    comment: str = ""
+    bmp_paths: list[str] = field(default_factory=list)
 
 
 def format_value(value: str) -> str:
@@ -427,17 +436,66 @@ def count_task_bmp_files(img_dir: str) -> int:
     )
 
 
-def extract_ordered_bmp_paths_from_folder(img_folder: str) -> list[str]:
-    """img フォルダ内の FILE= 順 BMP 絶対パス一覧を返す。"""
-    if not os.path.isdir(img_folder):
-        return []
-
-    bmp_files = sorted(
+def _list_folder_bmp_paths(img_folder: str) -> list[str]:
+    """img フォルダ直下の BMP 絶対パスをソートして返す。"""
+    return sorted(
         os.path.join(img_folder, name)
         for name in os.listdir(img_folder)
         if name.lower().endswith(".bmp")
         and os.path.isfile(os.path.join(img_folder, name))
     )
+
+
+def _parse_txt_image_references(txt_bytes: bytes) -> tuple[list[str], str]:
+    """参照用 txt から FILE= ファイル名と Comment= を取り出す。"""
+    referenced_names: list[str] = []
+    comment = ""
+    for raw_line in txt_bytes.splitlines(keepends=True):
+        line = raw_line.decode("utf-8", errors="ignore")
+        if not comment and "Comment=" in line:
+            comment = line.split("Comment=", 1)[1].strip()
+        if "FILE=" in line:
+            bmp_name = line.split("FILE=", 1)[1].strip()
+            if bmp_name:
+                referenced_names.append(bmp_name)
+    return referenced_names, comment
+
+
+def _resolve_referenced_bmp_paths(
+    referenced_names: list[str],
+    bmp_lookup: dict[str, str],
+    fallback: list[str],
+) -> list[str]:
+    """FILE= 名を実在 BMP パスへ解決する。1件も無い場合は fallback。"""
+    resolved: list[str] = []
+    for bmp_name in referenced_names:
+        full_path = bmp_lookup.get(bmp_name.lower())
+        if full_path:
+            resolved.append(full_path)
+    return resolved if resolved else fallback
+
+
+def select_task_image_source(
+    sources: list[TaskImageSource],
+    txt_name: Optional[str] = None,
+) -> Optional[TaskImageSource]:
+    """txt 名で参照ソースを選ぶ。未指定・不一致なら先頭を返す。"""
+    if not sources:
+        return None
+    if txt_name:
+        wanted = txt_name.lower()
+        for source in sources:
+            if source.txt_name.lower() == wanted:
+                return source
+    return sources[0]
+
+
+def list_task_image_sources_from_folder(img_folder: str) -> list[TaskImageSource]:
+    """img フォルダ内の参照用 txt ごとに FILE= 順の BMP を返す。"""
+    if not os.path.isdir(img_folder):
+        return []
+
+    bmp_files = _list_folder_bmp_paths(img_folder)
     txt_files = sorted(
         os.path.join(img_folder, name)
         for name in os.listdir(img_folder)
@@ -445,33 +503,48 @@ def extract_ordered_bmp_paths_from_folder(img_folder: str) -> list[str]:
         and os.path.isfile(os.path.join(img_folder, name))
     )
     if not txt_files:
-        return bmp_files
-
-    referenced_names: list[str] = []
-    try:
-        with open(txt_files[0], "rb") as txt_file:
-            txt_bytes = txt_file.read(MAX_ZIP_TEXT_BYTES)
-    except OSError:
-        return bmp_files
-
-    for raw_line in txt_bytes.splitlines(keepends=True):
-        line = raw_line.decode("utf-8", errors="ignore")
-        if "FILE=" in line:
-            bmp_name = line.split("FILE=", 1)[1].strip()
-            if bmp_name:
-                referenced_names.append(bmp_name)
+        return []
 
     bmp_lookup = {
         os.path.basename(path).lower(): path
         for path in bmp_files
     }
+    sources: list[TaskImageSource] = []
+    for txt_path in txt_files:
+        try:
+            with open(txt_path, "rb") as txt_file:
+                txt_bytes = txt_file.read(MAX_ZIP_TEXT_BYTES)
+        except OSError:
+            continue
+        referenced_names, comment = _parse_txt_image_references(txt_bytes)
+        sources.append(
+            TaskImageSource(
+                txt_name=os.path.basename(txt_path),
+                comment=comment,
+                bmp_paths=_resolve_referenced_bmp_paths(
+                    referenced_names, bmp_lookup, [],
+                ),
+            )
+        )
+    return sources
 
-    resolved: list[str] = []
-    for bmp_name in referenced_names:
-        full_path = bmp_lookup.get(bmp_name.lower())
-        if full_path:
-            resolved.append(full_path)
-    return resolved or bmp_files
+
+def extract_ordered_bmp_paths_from_folder(
+    img_folder: str,
+    txt_name: Optional[str] = None,
+) -> list[str]:
+    """img フォルダ内の FILE= 順 BMP 絶対パス一覧を返す。"""
+    if not os.path.isdir(img_folder):
+        return []
+
+    bmp_files = _list_folder_bmp_paths(img_folder)
+    sources = list_task_image_sources_from_folder(img_folder)
+    if not sources:
+        return bmp_files
+    selected = select_task_image_source(sources, txt_name)
+    if selected is None:
+        return bmp_files
+    return selected.bmp_paths or bmp_files
 
 
 def list_filesystem_task_folders(task_root: str) -> list[TaskFolder]:
@@ -514,11 +587,11 @@ def list_filesystem_task_folders(task_root: str) -> list[TaskFolder]:
     return sorted(folders, key=lambda folder: _task_folder_sort_key(folder.label))
 
 
-def extract_ordered_bmp_paths_from_zip(
+def list_task_image_sources_from_zip(
     task_file_path: str,
     task_prefix: Optional[str] = None,
-) -> list[str]:
-    """タスクファイル内の選択タスクから FILE= 順の BMP パスを返す。"""
+) -> list[TaskImageSource]:
+    """タスクファイル内の参照用 txt ごとに FILE= 順の BMP を返す。"""
     with zipfile.ZipFile(task_file_path, "r") as zip_ref:
         raw_names = zip_ref.namelist()
         normalized_names = [name.replace("\\", "/") for name in raw_names]
@@ -528,44 +601,59 @@ def extract_ordered_bmp_paths_from_zip(
         if not img_prefix:
             return []
 
-        bmp_files = sorted(
-            norm_to_raw.get(name, name)
-            for name in normalized_names
-            if name.startswith(img_prefix) and name.lower().endswith(".bmp")
-        )
-        txt_files = sorted(
-            name
-            for name in normalized_names
-            if name.startswith(img_prefix) and name.lower().endswith(".txt")
-        )
-        if not txt_files:
-            return bmp_files
-
-        referenced_names: list[str] = []
-        txt_bytes = read_zip_member(
-            zip_ref,
-            norm_to_raw.get(txt_files[0], txt_files[0]),
-            max_bytes=MAX_ZIP_TEXT_BYTES,
-        )
-        for raw_line in txt_bytes.splitlines(keepends=True):
-            line = raw_line.decode("utf-8", errors="ignore")
-            if "FILE=" in line:
-                bmp_name = line.split("FILE=", 1)[1].strip()
-                if bmp_name:
-                    referenced_names.append(bmp_name)
-
         bmp_lookup = {
             os.path.basename(name).lower(): norm_to_raw.get(name, name)
             for name in normalized_names
             if name.startswith(img_prefix) and name.lower().endswith(".bmp")
         }
+        txt_files = sorted(
+            name
+            for name in normalized_names
+            if name.startswith(img_prefix) and name.lower().endswith(".txt")
+        )
+        sources: list[TaskImageSource] = []
+        for txt_name in txt_files:
+            txt_bytes = read_zip_member(
+                zip_ref,
+                norm_to_raw.get(txt_name, txt_name),
+                max_bytes=MAX_ZIP_TEXT_BYTES,
+            )
+            referenced_names, comment = _parse_txt_image_references(txt_bytes)
+            sources.append(
+                TaskImageSource(
+                    txt_name=os.path.basename(txt_name),
+                    comment=comment,
+                    bmp_paths=_resolve_referenced_bmp_paths(
+                        referenced_names, bmp_lookup, [],
+                    ),
+                )
+            )
+        return sources
 
-        resolved: list[str] = []
-        for bmp_name in referenced_names:
-            full_path = bmp_lookup.get(bmp_name.lower())
-            if full_path:
-                resolved.append(full_path)
-        return resolved or bmp_files
+
+def extract_ordered_bmp_paths_from_zip(
+    task_file_path: str,
+    task_prefix: Optional[str] = None,
+    txt_name: Optional[str] = None,
+) -> list[str]:
+    """タスクファイル内の選択タスクから FILE= 順の BMP パスを返す。"""
+    sources = list_task_image_sources_from_zip(task_file_path, task_prefix)
+    selected = select_task_image_source(sources, txt_name)
+    if selected and selected.bmp_paths:
+        return selected.bmp_paths
+
+    with zipfile.ZipFile(task_file_path, "r") as zip_ref:
+        raw_names = zip_ref.namelist()
+        normalized_names = [name.replace("\\", "/") for name in raw_names]
+        norm_to_raw = _normalized_to_raw_map(raw_names, normalized_names)
+        img_prefix = _find_img_prefix(normalized_names, task_prefix)
+        if not img_prefix:
+            return []
+        return sorted(
+            norm_to_raw.get(name, name)
+            for name in normalized_names
+            if name.startswith(img_prefix) and name.lower().endswith(".bmp")
+        )
 
 
 def _find_img_prefix(
