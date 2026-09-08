@@ -19,6 +19,7 @@ import save_task_images_CamNum_selection
 from PIL import Image
 from security_limits import (
     ImageSizeError,
+    MAX_ZIP_TEXT_BYTES,
     open_image_from_bytes,
     open_image_file,
     read_zip_member,
@@ -39,6 +40,8 @@ from utils import (
     pick_sample_paths,
     resolve_task_folder_metadata,
     select_task_image_source,
+    _find_img_prefix,
+    _normalized_to_raw_map,
 )
 
 ALLOWED_PLACEHOLDERS = {"comment", "tool", "original", "cam", "div", "index", "file"}
@@ -362,6 +365,220 @@ def extract_viewer_bmp_from_path(bmp_path: str) -> Optional[ViewerImageAsset]:
         )
     except (ImageSizeError, Exception):
         return None
+
+
+def _copy_bmp_bytes_to_path(dest_path: str, data: bytes) -> None:
+    dest_dir = os.path.dirname(dest_path)
+    if dest_dir:
+        os.makedirs(dest_dir, exist_ok=True)
+    with open(dest_path, "wb") as out:
+        out.write(data)
+
+
+def _copy_bmp_file_to_path(src_path: str, dest_path: str) -> None:
+    dest_dir = os.path.dirname(dest_path)
+    if dest_dir:
+        os.makedirs(dest_dir, exist_ok=True)
+    if os.path.abspath(src_path) == os.path.abspath(dest_path):
+        return
+    shutil.copy2(src_path, dest_path)
+
+
+def save_viewer_bmp_to_path(
+    dest_path: str,
+    *,
+    temp_bmp_path: Optional[str] = None,
+    zip_path: Optional[str] = None,
+    bmp_path_in_zip: Optional[str] = None,
+    source_bmp_path: Optional[str] = None,
+) -> Optional[str]:
+    """表示中の原寸 BMP を dest_path へ保存する。成功時は None。"""
+    dest = (dest_path or "").strip()
+    if not dest:
+        return "保存先が指定されていません。"
+
+    try:
+        if temp_bmp_path and os.path.isfile(temp_bmp_path):
+            _copy_bmp_file_to_path(temp_bmp_path, dest)
+            return None
+
+        if zip_path and bmp_path_in_zip:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                raw = read_zip_member(zf, bmp_path_in_zip)
+            open_image_from_bytes(raw)
+            _copy_bmp_bytes_to_path(dest, raw)
+            return None
+
+        if source_bmp_path and os.path.isfile(source_bmp_path):
+            with open_image_file(source_bmp_path):
+                pass
+            _copy_bmp_file_to_path(source_bmp_path, dest)
+            return None
+    except (ImageSizeError, OSError, zipfile.BadZipFile) as ex:
+        return f"画像の保存に失敗しました: {ex}"
+    except Exception as ex:
+        return f"画像の保存に失敗しました: {ex}"
+
+    return "保存する画像がありません。"
+
+
+_DEFAULT_SAVE_TEMPLATES = {
+    "template1": "{comment}_{index}",
+    "template2": "{comment}_{tool}",
+    "template3": "{original}",
+}
+
+
+def _same_preview_bmp(path: str, bmp_path: str) -> bool:
+    if not path or not bmp_path:
+        return False
+    if path.replace("\\", "/") == bmp_path.replace("\\", "/"):
+        return True
+    return os.path.basename(path).lower() == os.path.basename(bmp_path).lower()
+
+
+def load_preview_tool_comments_from_folder(img_folder: str) -> list[str]:
+    """img フォルダの親にある cammaster_seq.log からツール名を取得する。"""
+    if not img_folder:
+        return []
+    log_path = os.path.join(os.path.dirname(img_folder), "cammaster_seq.log")
+    return save_task_images_CamNum_selection.parse_cammaster_log_ordered(log_path)
+
+
+def load_preview_tool_comments_from_zip(
+    zip_path: str,
+    task_prefix: Optional[str] = None,
+) -> list[str]:
+    """タスクファイル内の cammaster_seq.log からツール名を取得する。"""
+    if not zip_path or not os.path.isfile(zip_path):
+        return []
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zip_ref:
+            raw_names = zip_ref.namelist()
+            normalized_names = [name.replace("\\", "/") for name in raw_names]
+            norm_to_raw = _normalized_to_raw_map(raw_names, normalized_names)
+            img_prefix = _find_img_prefix(normalized_names, task_prefix)
+            candidates: list[str] = []
+            if img_prefix and img_prefix.endswith("img/"):
+                candidates.append(img_prefix[: -len("img/")] + "cammaster_seq.log")
+            for name in normalized_names:
+                if os.path.basename(name).lower() == "cammaster_seq.log":
+                    candidates.append(name)
+            seen: set[str] = set()
+            for candidate in candidates:
+                key = candidate.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                raw_name = norm_to_raw.get(candidate)
+                if raw_name is None:
+                    for norm, raw in norm_to_raw.items():
+                        if norm.lower() == key:
+                            raw_name = raw
+                            break
+                if not raw_name:
+                    continue
+                raw = read_zip_member(
+                    zip_ref, raw_name, max_bytes=MAX_ZIP_TEXT_BYTES,
+                )
+                tools = (
+                    save_task_images_CamNum_selection.parse_cammaster_log_ordered_text(
+                        raw.decode("utf-8", errors="ignore"),
+                    )
+                )
+                if tools:
+                    return tools
+    except (OSError, zipfile.BadZipFile, Exception):
+        return []
+    return []
+
+
+def build_preview_save_filename(
+    bmp_path: str,
+    sources: list[TaskImageSource],
+    *,
+    selected_txt_name: Optional[str] = None,
+    filename_templates: Optional[dict] = None,
+    tool_comments: Optional[list[str]] = None,
+) -> str:
+    """OK 保存と同じテンプレートで、プレビュー1枚の保存ファイル名を作る。"""
+    file_name = os.path.basename(bmp_path or "")
+    if not file_name:
+        return "image.bmp"
+
+    templates = filename_templates or dict(_DEFAULT_SAVE_TEMPLATES)
+    matches: list[tuple[TaskImageSource, int]] = []
+    for source in sources or []:
+        for index, path in enumerate(source.bmp_paths, 1):
+            if _same_preview_bmp(path, bmp_path):
+                matches.append((source, index))
+
+    selected: Optional[TaskImageSource] = None
+    index = 1
+    if matches:
+        if selected_txt_name:
+            wanted = selected_txt_name.lower()
+            for source, idx in matches:
+                if source.txt_name.lower() == wanted:
+                    selected, index = source, idx
+                    break
+        if selected is None:
+            selected, index = matches[0]
+
+    if selected is None:
+        stem, ext = os.path.splitext(file_name)
+        return file_name if ext.lower() == ".bmp" else f"{stem or 'image'}.bmp"
+
+    cam_div = save_task_images_CamNum_selection.find_cam_and_div(file_name)
+    cam = cam_div[0] if len(cam_div) > 0 else ""
+    div = cam_div[1] if len(cam_div) > 1 else ""
+    tool_comment = None
+    if tool_comments and 0 <= index - 1 < len(tool_comments):
+        tool_comment = tool_comments[index - 1]
+
+    # プレビューの「名前を付けて保存」は1枚だけなので、一括保存用の
+    # 重複コメント接尾辞 (_{file} = 参照txt名のタイムスタンプ) は付けない。
+    new_name = save_task_images_CamNum_selection.generate_new_file_name(
+        {
+            "comment": selected.comment,
+            "fileName": os.path.splitext(selected.txt_name)[0],
+        },
+        file_name,
+        index,
+        tool_comment,
+        cam,
+        div,
+        templates,
+        False,
+    )
+    if not new_name:
+        new_name = os.path.splitext(file_name)[0] or "image"
+    return f"{new_name}.bmp"
+
+
+def resolve_preview_save_filename(
+    bmp_path: str,
+    sources: list[TaskImageSource],
+    *,
+    selected_txt_name: Optional[str] = None,
+    zip_path: Optional[str] = None,
+    img_folder: Optional[str] = None,
+    task_prefix: Optional[str] = None,
+    filename_templates: Optional[dict] = None,
+) -> str:
+    """プレビュー保存用の初期ファイル名を、ツールコメント込みで解決する。"""
+    tool_comments: list[str] = []
+    if img_folder:
+        tool_comments = load_preview_tool_comments_from_folder(img_folder)
+    elif zip_path:
+        tool_comments = load_preview_tool_comments_from_zip(zip_path, task_prefix)
+    return build_preview_save_filename(
+        bmp_path,
+        sources,
+        selected_txt_name=selected_txt_name,
+        filename_templates=filename_templates,
+        tool_comments=tool_comments,
+    )
 
 
 def extract_task_folder_metadata(task_dir: str) -> TaskZipMetadata:

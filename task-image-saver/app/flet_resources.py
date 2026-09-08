@@ -17,6 +17,11 @@ from typing import Callable
 
 from utils import TASK_FILE_DIALOG_TYPES
 
+BMP_SAVE_DIALOG_TYPES = [
+    ("BMP 画像", "*.bmp"),
+    ("すべて", "*.*"),
+]
+
 # Windows タスクバーで独自アイコンを表示するための AppUserModelID 設定
 if sys.platform == "win32":
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
@@ -312,6 +317,27 @@ if ($path -and $env:TIS_OUT_FILE) {
 }
 """
 
+# 保存: SaveFileDialog（上書き確認付き）
+_SELECT_SAVE_FILE_PS = r"""
+Add-Type -AssemblyName System.Windows.Forms
+$path = ''
+$dlg = New-Object System.Windows.Forms.SaveFileDialog
+$dlg.AutoUpgradeEnabled = $true
+$dlg.Title = $env:TIS_DIALOG_TITLE
+$dlg.Filter = $env:TIS_FILE_FILTER
+$dlg.FileName = $env:TIS_DEFAULT_NAME
+if ($env:TIS_DEFAULT_EXT) { $dlg.DefaultExt = $env:TIS_DEFAULT_EXT }
+$dlg.AddExtension = $true
+$dlg.OverwritePrompt = $true
+$dlg.CheckPathExists = $true
+if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+    $path = $dlg.FileName
+}
+if ($path -and $env:TIS_OUT_FILE) {
+    [IO.File]::WriteAllText($env:TIS_OUT_FILE, $path, [Text.UTF8Encoding]::new($false))
+}
+"""
+
 
 def _powershell_dialog_env(title: str) -> dict[str, str]:
     env = {"TIS_DIALOG_TITLE": title}
@@ -336,6 +362,19 @@ def _select_file_powershell() -> str:
     env = _powershell_dialog_env("タスクファイルを選択")
     env["TIS_FILE_FILTER"] = task_filter
     return _run_powershell_dialog(_SELECT_FILE_PS, env=env)
+
+
+def _select_save_file_powershell(
+    default_name: str,
+    filetypes: list[tuple[str, str]],
+    title: str,
+    default_ext: str,
+) -> str:
+    env = _powershell_dialog_env(title)
+    env["TIS_FILE_FILTER"] = _powershell_file_filter(filetypes)
+    env["TIS_DEFAULT_NAME"] = default_name
+    env["TIS_DEFAULT_EXT"] = default_ext
+    return _run_powershell_dialog(_SELECT_SAVE_FILE_PS, env=env)
 
 
 # --- Windows Vista+ 共通ダイアログ (IFileOpenDialog / 開発・非配布向け) ---
@@ -565,6 +604,31 @@ def _file_filter_string() -> str:
     return f"タスクファイル\0{ext_glob}\0すべて\0*.*\0\0"
 
 
+def _dialog_filter_string(filetypes: list[tuple[str, str]]) -> str:
+    """GetOpenFileNameW / GetSaveFileNameW 用のフィルタ（NUL 区切り）。"""
+    parts: list[str] = []
+    for label, pattern in filetypes:
+        parts.append(label)
+        parts.append(pattern)
+    return "\0".join(parts) + "\0\0"
+
+
+def _powershell_file_filter(filetypes: list[tuple[str, str]]) -> str:
+    """OpenFileDialog / SaveFileDialog 用の Filter 文字列。"""
+    return "|".join(part for pair in filetypes for part in pair)
+
+
+def _default_save_extension(default_name: str, filetypes: list[tuple[str, str]]) -> str:
+    ext = os.path.splitext(default_name)[1].lstrip(".").lower()
+    if ext:
+        return ext
+    for _label, pattern in filetypes:
+        cleaned = pattern.replace("*", "").replace(".", "").split(";")[0].strip()
+        if cleaned and cleaned != "*":
+            return cleaned
+    return "bmp"
+
+
 def _select_file_win32() -> str:
     """エクスプローラー形式のファイル選択（Vista+ 共通ダイアログ）。"""
     if sys.platform != "win32":
@@ -617,6 +681,76 @@ def _select_file_win32() -> str:
         ctypes.windll.user32.SetForegroundWindow(owner)
 
     if comdlg32.GetOpenFileNameW(ctypes.byref(ofn)):
+        return buf.value
+    return ""
+
+
+def _select_save_file_win32(
+    default_name: str,
+    filetypes: list[tuple[str, str]],
+    title: str,
+    default_ext: str,
+) -> str:
+    """エクスプローラー形式の名前を付けて保存。"""
+    if sys.platform != "win32":
+        return ""
+
+    comdlg32 = ctypes.windll.comdlg32
+    OFN_EXPLORER = 0x00080000
+    OFN_PATHMUSTEXIST = 0x00000800
+    OFN_OVERWRITEPROMPT = 0x00000002
+    OFN_HIDEREADONLY = 0x00000004
+
+    class OPENFILENAMEW(ctypes.Structure):
+        _fields_ = [
+            ("lStructSize", wintypes.DWORD),
+            ("hwndOwner", wintypes.HWND),
+            ("hInstance", wintypes.HINSTANCE),
+            ("lpstrFilter", wintypes.LPCWSTR),
+            ("lpstrCustomFilter", wintypes.LPWSTR),
+            ("nMaxCustFilter", wintypes.DWORD),
+            ("nFilterIndex", wintypes.DWORD),
+            ("lpstrFile", wintypes.LPWSTR),
+            ("nMaxFile", wintypes.DWORD),
+            ("lpstrFileTitle", wintypes.LPWSTR),
+            ("nMaxFileTitle", wintypes.DWORD),
+            ("lpstrInitialDir", wintypes.LPCWSTR),
+            ("lpstrTitle", wintypes.LPCWSTR),
+            ("Flags", wintypes.DWORD),
+            ("nFileOffset", wintypes.WORD),
+            ("nFileExtension", wintypes.WORD),
+            ("lpstrDefExt", wintypes.LPCWSTR),
+            ("lCustData", wintypes.LPARAM),
+            ("lpfnHook", wintypes.LPVOID),
+            ("lpTemplateName", wintypes.LPCWSTR),
+            ("pvReserved", wintypes.LPVOID),
+            ("dwReserved", wintypes.DWORD),
+            ("FlagsEx", wintypes.DWORD),
+        ]
+
+    buf = ctypes.create_unicode_buffer(32768)
+    if default_name:
+        buf.value = default_name
+    ofn = OPENFILENAMEW()
+    ofn.lStructSize = ctypes.sizeof(OPENFILENAMEW)
+    owner = _owner_hwnd()
+    ofn.hwndOwner = owner or None
+    ofn.lpstrFilter = _dialog_filter_string(filetypes)
+    ofn.lpstrFile = buf
+    ofn.nMaxFile = len(buf)
+    ofn.lpstrTitle = title
+    ofn.lpstrDefExt = default_ext
+    ofn.Flags = (
+        OFN_EXPLORER
+        | OFN_PATHMUSTEXIST
+        | OFN_OVERWRITEPROMPT
+        | OFN_HIDEREADONLY
+    )
+
+    if owner:
+        ctypes.windll.user32.SetForegroundWindow(owner)
+
+    if comdlg32.GetSaveFileNameW(ctypes.byref(ofn)):
         return buf.value
     return ""
 
@@ -774,4 +908,38 @@ def select_file_dialog() -> str:
         if _is_packaged_runtime():
             return _select_file_powershell()
         return _run_sta_dialog(_select_file_win32)
+    return ""
+
+
+def select_save_file_dialog(
+    default_name: str = "",
+    filetypes: list[tuple[str, str]] | None = None,
+    title: str = "画像を保存",
+) -> str:
+    """名前を付けて保存ダイアログを表示する。キャンセル時は空文字。"""
+    types = filetypes or BMP_SAVE_DIALOG_TYPES
+    name = os.path.basename(default_name or "image.bmp")
+    default_ext = _default_save_extension(name, types)
+
+    if _tkinter_available():
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        file = filedialog.asksaveasfilename(
+            title=title,
+            initialfile=name,
+            defaultextension=f".{default_ext}",
+            filetypes=types,
+        )
+        root.destroy()
+        return file or ""
+    if sys.platform == "win32":
+        if _is_packaged_runtime():
+            return _select_save_file_powershell(name, types, title, default_ext)
+        return _run_sta_dialog(
+            lambda: _select_save_file_win32(name, types, title, default_ext),
+        )
     return ""

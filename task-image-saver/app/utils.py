@@ -450,8 +450,8 @@ def _parse_txt_image_references(txt_bytes: bytes) -> tuple[list[str], str]:
     """参照用 txt から FILE= ファイル名と Comment= を取り出す。"""
     referenced_names: list[str] = []
     comment = ""
-    for raw_line in txt_bytes.splitlines(keepends=True):
-        line = raw_line.decode("utf-8", errors="ignore")
+    text = _decode_task_info_bytes(txt_bytes)[0]
+    for line in text.splitlines():
         if not comment and "Comment=" in line:
             comment = line.split("Comment=", 1)[1].strip()
         if "FILE=" in line:

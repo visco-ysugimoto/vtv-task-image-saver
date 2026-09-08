@@ -318,18 +318,25 @@ def parse_cammaster_log(log_file_path):
     return cam_info_dict
 
 
+def parse_cammaster_log_ordered_text(text):
+    """cammaster_seq.log 本文から、出現順にツール名のリストを返す"""
+    result = []
+    if not text:
+        return result
+    for line in str(text).splitlines():
+        match = re.search(
+            r'\((\d+),\s*(\d+):\d+\)\s*:\s*画像取込,\s*name\s*=\s*(\w+)', line)
+        if match:
+            result.append(match.group(3))
+    return result
+
+
 def parse_cammaster_log_ordered(log_file_path):
     """cammaster_seq.logを読み込み、出現順にツール名のリストを返す"""
-    result = []
     if not os.path.exists(log_file_path):
-        return result
+        return []
     with open(log_file_path, 'r', encoding='utf-8') as file:
-        for line in file:
-            match = re.search(
-                r'\((\d+),\s*(\d+):\d+\)\s*:\s*画像取込,\s*name\s*=\s*(\w+)', line)
-            if match:
-                result.append(match.group(3))
-    return result
+        return parse_cammaster_log_ordered_text(file.read())
 
 
 def process_images(folder_path, output_folder, save_mode, save_cam,

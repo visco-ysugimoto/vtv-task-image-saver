@@ -22,9 +22,11 @@ from flet_dropzone_support import (
     wrap_with_task_file_dropzone,
 )
 from flet_resources import (
+    BMP_SAVE_DIALOG_TYPES,
     resolve_resource_path,
     select_file_dialog,
     select_folder_dialog,
+    select_save_file_dialog,
     set_window_icon_win32,
 )
 from flet_ui_constants import (
@@ -68,7 +70,9 @@ from task_image_saver_logic import (
     load_task_file_preview,
     parse_int_value,
     prepare_option2_extraction,
+    resolve_preview_save_filename,
     run_image_processing_jobs,
+    save_viewer_bmp_to_path,
     snapshot_output_files,
     task_folder_group,
     task_folder_task,
@@ -356,6 +360,20 @@ class TaskImageSaverApp:
             actions_alignment=ft.MainAxisAlignment.END,
         )
         self._add_dialog(dialog)
+
+    def _show_snack(self, message: str, *, error: bool = False):
+        """短い通知。ビューア overlay は閉じない。"""
+        try:
+            self.page.show_dialog(
+                ft.SnackBar(
+                    content=ft.Text(message, color=ft.Colors.WHITE),
+                    duration=3000,
+                    bgcolor=ft.Colors.RED_700 if error else ft.Colors.GREY_800,
+                )
+            )
+            self.page.update()
+        except Exception as ex:
+            print(f"SnackBar表示エラー: {ex}")
 
     def _show_success_dialog(self, output_folder_path: str):
         """保存完了ダイアログ（フォルダを開くボタン付き）"""
@@ -1310,6 +1328,7 @@ class TaskImageSaverApp:
             "grid_drawn": None,
             "grid_rebuild_busy": False,
             "load_generation": 0,
+            "saving": False,
         }
         overlay_ref = ft.Ref[ft.Container]()
         panel_ref = ft.Ref[ft.Container]()
@@ -1322,6 +1341,7 @@ class TaskImageSaverApp:
         counter_ref = ft.Ref[ft.Text]()
         name_ref = ft.Ref[ft.Text]()
         fullscreen_btn_ref = ft.Ref[ft.IconButton]()
+        save_btn_ref = ft.Ref[ft.IconButton]()
         grid_toggle_btn_ref = ft.Ref[ft.IconButton]()
         grid_spacing_text_ref = ft.Ref[ft.Text]()
         header_ref = ft.Ref[ft.Row]()
@@ -1789,6 +1809,16 @@ class TaskImageSaverApp:
             state["fullscreen"] = not state["fullscreen"]
             apply_layout()
 
+        def set_save_enabled(enabled: bool) -> None:
+            btn = save_btn_ref.current
+            if not btn:
+                return
+            btn.disabled = not enabled or state.get("saving")
+            try:
+                btn.update()
+            except Exception:
+                pass
+
         async def load_current_image_async():
             generation = state["load_generation"]
             idx = state["idx"]
@@ -1796,6 +1826,7 @@ class TaskImageSaverApp:
                 return
 
             clear_grid_cache()
+            set_save_enabled(False)
             if loading_ref.current:
                 loading_ref.current.visible = True
             if img_ref.current:
@@ -1854,6 +1885,7 @@ class TaskImageSaverApp:
 
                 self.page.update()
                 await apply_fit_async()
+                set_save_enabled(True)
                 self.page.update()
             finally:
                 if loading_ref.current:
@@ -1871,6 +1903,91 @@ class TaskImageSaverApp:
         def on_next(_e):
             state["idx"] = (state["idx"] + 1) % len(bmp_paths)
             update_view()
+
+        async def save_current_image_async():
+            if state.get("saving"):
+                return
+            idx = state["idx"]
+            if idx < 0 or idx >= len(bmp_paths):
+                return
+            source_path = bmp_paths[idx]
+            default_name = await asyncio.to_thread(
+                resolve_preview_save_filename,
+                source_path,
+                list(self._preview_image_sources),
+                selected_txt_name=self._preview_txt_name or None,
+                zip_path=(
+                    self._preview_zip_path
+                    if self._preview_source == "zip"
+                    else None
+                ),
+                img_folder=(
+                    self._preview_img_folder
+                    if self._preview_source == "folder"
+                    else None
+                ),
+                task_prefix=self._option2_selected_task_prefix,
+                filename_templates=dict(DEFAULT_FILENAME_TEMPLATES),
+            )
+            if not default_name:
+                default_name = os.path.basename(source_path) or "image.bmp"
+            temp_bmp = state.get("bmp_tmp")
+            use_temp = bool(
+                temp_bmp
+                and os.path.isfile(temp_bmp)
+                and state["idx"] == idx
+            )
+            zip_path = (
+                self._preview_zip_path
+                if self._preview_source == "zip"
+                else ""
+            )
+            folder_source = (
+                source_path
+                if self._preview_source == "folder"
+                else ""
+            )
+
+            state["saving"] = True
+            set_save_enabled(False)
+            try:
+                dest = await asyncio.to_thread(
+                    select_save_file_dialog,
+                    default_name,
+                    BMP_SAVE_DIALOG_TYPES,
+                    "画像を保存",
+                )
+                if not dest or not _viewer_is_active():
+                    return
+
+                still_same = state["idx"] == idx
+                error = await asyncio.to_thread(
+                    save_viewer_bmp_to_path,
+                    dest,
+                    temp_bmp_path=(
+                        temp_bmp if use_temp and still_same else None
+                    ),
+                    zip_path=zip_path or None,
+                    bmp_path_in_zip=(
+                        source_path if zip_path else None
+                    ),
+                    source_bmp_path=folder_source or None,
+                )
+                if not _viewer_is_active():
+                    return
+                if error:
+                    self._show_snack(error, error=True)
+                    return
+                self._show_snack(
+                    f"保存しました: {os.path.basename(dest)}"
+                )
+            finally:
+                state["saving"] = False
+                if _viewer_is_active():
+                    set_save_enabled(bool(state.get("bmp_tmp")))
+
+        def on_save(_e):
+            self.page.run_task(save_current_image_async)
 
         def cleanup():
             state["load_generation"] += 1
@@ -1923,6 +2040,13 @@ class TaskImageSaverApp:
                                     ),
                                     ft.Row(
                                         [
+                                            ft.IconButton(
+                                                ref=save_btn_ref,
+                                                icon=ft.Icons.SAVE,
+                                                tooltip="この画像を保存",
+                                                on_click=on_save,
+                                                disabled=True,
+                                            ),
                                             ft.IconButton(
                                                 ref=fullscreen_btn_ref,
                                                 icon=ft.Icons.FULLSCREEN,
