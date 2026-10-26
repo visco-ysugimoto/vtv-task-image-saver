@@ -82,7 +82,11 @@ from task_tool_layout import (
     load_tool_layout_from_folder,
     load_tool_layout_from_zip,
 )
-from task_tool_layout_view import build_tool_layout_dialog, render_tool_layout_png
+from task_tool_layout_view import (
+    build_tool_layout_dialog,
+    render_tool_layout_png,
+    render_tool_layout_xlsx,
+)
 from utils import (
     TASK_FILE_EXTENSIONS_LABEL,
     TaskFolder,
@@ -906,12 +910,16 @@ class TaskImageSaverApp:
                 self._save_tool_layout_image, layout, label, title, compact,
             )
 
+        def save_excel(_e):
+            self.page.run_task(self._save_tool_layout_excel, layout, label, title)
+
         dialog = build_tool_layout_dialog(
             layout,
             page=self.page,
             title=title,
             on_close=close,
             on_save=save,
+            on_save_excel=save_excel,
             width=max(520.0, min(1100.0, page_w - 120)),
             height=max(360.0, min(720.0, page_h - 180)),
         )
@@ -942,6 +950,32 @@ class TaskImageSaverApp:
             )
         except Exception as ex:
             self._show_snack(f"画像の保存に失敗しました: {ex}", error=True)
+            return
+        self._show_snack(f"保存しました: {dest}")
+
+    async def _save_tool_layout_excel(self, layout, label: str, title: str):
+        cleaned = re.sub(r'[\\/:*?"<>|]+', "_", (label or "").strip()) or "task"
+        default_name = f"{cleaned}_ツール構成.xlsx"
+        try:
+            dest = await asyncio.to_thread(
+                select_save_file_dialog,
+                default_name,
+                [("Excel ブック", "*.xlsx")],
+                "ツール構成をExcelで保存",
+            )
+        except Exception as ex:
+            self._show_snack(f"保存ダイアログを開けませんでした: {ex}", error=True)
+            return
+        if not dest:
+            return
+        if not dest.lower().endswith(".xlsx"):
+            dest += ".xlsx"
+        try:
+            await asyncio.to_thread(
+                render_tool_layout_xlsx, dest, layout, title=title,
+            )
+        except Exception as ex:
+            self._show_snack(f"Excelの保存に失敗しました: {ex}", error=True)
             return
         self._show_snack(f"保存しました: {dest}")
 

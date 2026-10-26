@@ -160,10 +160,11 @@ class _Box:
     top: float
     height: float = _CELL_H
     v_gap: float = _V_GAP
+    width: float = _CELL_W
 
     @property
     def right(self) -> float:
-        return self.left + _CELL_W
+        return self.left + self.width
 
     @property
     def bottom(self) -> float:
@@ -198,6 +199,7 @@ def build_tool_layout_dialog(
     title: str,
     on_close,
     on_save,
+    on_save_excel,
     width: float,
     height: float,
 ) -> ft.AlertDialog:
@@ -321,6 +323,11 @@ def build_tool_layout_dialog(
                 icon=ft.Icons.IMAGE,
                 on_click=_save,
             ),
+            ft.TextButton(
+                "Excelとして保存",
+                icon=ft.Icons.TABLE_CHART,
+                on_click=on_save_excel,
+            ),
             ft.TextButton("閉じる", on_click=_close),
         ],
         actions_alignment=ft.MainAxisAlignment.END,
@@ -339,6 +346,495 @@ def render_tool_layout_png(
     metrics = _COMPACT if compact else _NORMAL
     image = _render_tool_layout_image(layout, title=title, metrics=metrics)
     image.save(path, "PNG")
+
+
+def render_tool_layout_xlsx(path: str, layout: ToolLayout, *, title: str) -> None:
+    """ツール構成を Excel ブックに書き出す。矢印はセルに追従する線図形にする。"""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.worksheet.page import PageMargins
+
+    book = Workbook()
+    grid = book.active
+    grid.title = "ツール構成"
+    drawing = _write_layout_grid(
+        grid, layout, title=title, styles=(Alignment, Border, Font, PatternFill, Side),
+    )
+    listing = book.create_sheet("一覧")
+    _write_layout_list(listing, layout, styles=(Alignment, Border, Font, PatternFill, Side))
+    for sheet in (grid, listing):
+        sheet.page_setup.orientation = "landscape"
+        sheet.page_setup.fitToWidth = 1
+        sheet.page_setup.fitToHeight = 0
+        sheet.page_setup.paperSize = sheet.PAPERSIZE_A3
+        sheet.sheet_properties.pageSetUpPr.fitToPage = True
+        sheet.page_margins = PageMargins(left=0.4, right=0.4, top=0.5, bottom=0.5)
+        sheet.oddHeader.left.text = title or "ツール構成"
+    book.save(path)
+    if drawing:
+        _embed_excel_drawing(path, drawing)
+
+
+def _write_layout_grid(sheet, layout: ToolLayout, *, title: str, styles) -> str | None:
+    from openpyxl.utils import get_column_letter
+
+    Alignment, Border, Font, PatternFill, Side = styles
+    cameras = layout.cameras
+    rails = _prepare_rails(layout)
+    label_width = 8
+    tool_width = 30
+    gutter_width = _col_width_from_px(rails.gutter + 10)
+    columns = 1 + max(1, len(cameras) * 2)
+    thin = Side(style="thin", color="BDBDBD")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    header_fill = PatternFill("solid", fgColor="E8EAED")
+    header_font = Font(name="Yu Gothic", size=11, bold=True, color="212121")
+    title_font = Font(name="Yu Gothic", size=14, bold=True, color="212121")
+    note_font = Font(name="Yu Gothic", size=10, color="616161")
+    body_font = Font(name="Yu Gothic", size=10, color=_TOOL_FG.lstrip("#"))
+    wrap = Alignment(wrap_text=True, vertical="top", horizontal="left")
+    center = Alignment(wrap_text=True, vertical="center", horizontal="center")
+
+    sheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=columns)
+    sheet["A1"] = _xlsx_text(title or "ツール構成")
+    sheet["A1"].font = title_font
+    sheet["A1"].alignment = Alignment(vertical="center", horizontal="left")
+    sheet.row_dimensions[1].height = 24
+
+    sheet.merge_cells(start_row=2, start_column=1, end_row=2, end_column=columns)
+    sheet["A2"] = "赤線は画像参照、青線は座標参照。×は実行されないツール。線はセルに追従します。"
+    sheet["A2"].font = note_font
+    sheet.row_dimensions[2].height = 18
+
+    corner = sheet.cell(3, 1, "行")
+    corner.font = header_font
+    corner.fill = header_fill
+    corner.alignment = center
+    corner.border = border
+    for index, camera in enumerate(cameras):
+        tool_col = 2 + index * 2
+        gutter_col = tool_col + 1
+        cell = sheet.cell(3, tool_col, _camera_label(camera))
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center
+        cell.border = border
+        gutter = sheet.cell(3, gutter_col, "")
+        gutter.fill = header_fill
+        gutter.border = border
+    if not cameras:
+        sheet.cell(4, 1, "ツールがありません。").font = body_font
+        return None
+
+    by_pos = {(tool.camera, tool.row): tool for tool in layout.tools}
+    for row in range(1, layout.max_row + 1):
+        excel_row = row + 3
+        label = sheet.cell(excel_row, 1, row)
+        label.font = header_font
+        label.fill = header_fill
+        label.alignment = center
+        label.border = border
+        line_count = 1
+        for index, camera in enumerate(cameras):
+            tool_col = 2 + index * 2
+            gutter_col = tool_col + 1
+            tool = by_pos.get((camera.number, row))
+            cell = sheet.cell(excel_row, tool_col)
+            cell.border = border
+            cell.alignment = wrap
+            gutter = sheet.cell(excel_row, gutter_col, "")
+            gutter.border = border
+            gutter.fill = PatternFill("solid", fgColor="FFFFFF")
+            if tool is None:
+                cell.fill = PatternFill("solid", fgColor="FFFFFF")
+                continue
+            lines = _tool_lines(tool)
+            line_count = max(line_count, len(lines))
+            cell.value = "\n".join(lines)
+            cell.font = body_font
+            cell.fill = PatternFill("solid", fgColor=_tool_fill(tool))
+        sheet.row_dimensions[excel_row].height = max(36, 15 * line_count + 8)
+
+    sheet.column_dimensions["A"].width = label_width
+    for index in range(len(cameras)):
+        tool_col = 2 + index * 2
+        sheet.column_dimensions[get_column_letter(tool_col)].width = tool_width
+        sheet.column_dimensions[get_column_letter(tool_col + 1)].width = gutter_width
+    sheet.freeze_panes = "B4"
+    sheet.print_title_rows = "1:3"
+    sheet.page_setup.horizontalCentered = True
+    sheet.sheet_view.showGridLines = False
+    return _excel_arrow_drawing(
+        sheet,
+        layout,
+        rails,
+        label_width=label_width,
+        tool_width=tool_width,
+        gutter_width=gutter_width,
+    )
+
+
+def _write_layout_list(sheet, layout: ToolLayout, *, styles) -> None:
+    from openpyxl.utils import get_column_letter
+
+    Alignment, Border, Font, PatternFill, Side = styles
+    headers = ("カメラ", "行", "ツール名", "コメント", "実行", "画像参照", "座標参照")
+    header_font = Font(name="Yu Gothic", size=11, bold=True, color="212121")
+    header_fill = PatternFill("solid", fgColor="E8EAED")
+    body_font = Font(name="Yu Gothic", size=10, color="212121")
+    thin = Side(style="thin", color="E0E0E0")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(vertical="center", horizontal="center")
+    left = Alignment(vertical="center", horizontal="left")
+    for index, header in enumerate(headers, start=1):
+        cell = sheet.cell(1, index, header)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center
+        cell.border = border
+    for row_index, tool in enumerate(layout.tools, start=2):
+        values = (
+            tool.camera,
+            tool.row,
+            _xlsx_text(tool.tool_name),
+            _xlsx_text(tool.comment),
+            "する" if tool.enabled else "しない",
+            _link_text(tool.ref),
+            _link_text(tool.coor),
+        )
+        for index, value in enumerate(values, start=1):
+            cell = sheet.cell(row_index, index, value)
+            cell.font = body_font
+            cell.border = border
+            cell.alignment = center if index in (1, 2, 5) else left
+        sheet.cell(row_index, 3).fill = PatternFill("solid", fgColor=_tool_fill(tool))
+    sheet.auto_filter.ref = f"A1:G{max(1, len(layout.tools) + 1)}"
+    sheet.freeze_panes = "A2"
+    widths = (10, 8, 28, 28, 10, 36, 36)
+    for index, width in enumerate(widths, start=1):
+        sheet.column_dimensions[get_column_letter(index)].width = width
+    sheet.sheet_view.showGridLines = False
+
+
+def _tool_lines(tool: ToolCell) -> list[str]:
+    name = _xlsx_text(tool.tool_name)
+    if not tool.enabled:
+        name = f"× {name}"
+    lines = [name]
+    comment = _xlsx_text(tool.comment)
+    if comment:
+        lines.append(comment)
+    return lines
+
+
+def _link_text(link) -> str:
+    if link is None:
+        return ""
+    return f"[{link.camera}] {link.row} {_xlsx_text(link.name)}".strip()
+
+
+def _tool_fill(tool: ToolCell) -> str:
+    color = _DISABLED_BG if not tool.enabled else _TOOL_COLORS.get(tool.tool_name, _UNKNOWN_BG)
+    return color.lstrip("#")
+
+
+def _xlsx_text(value: str) -> str:
+    return "".join(
+        ch for ch in (value or "")
+        if ch in "\t\n\r" or ord(ch) >= 32
+    )
+
+
+def _px_from_col_width(width: float) -> float:
+    """Excel の列幅（文字数）を、矢印位置に使うピクセルへ換算する。"""
+    return int(((256 * width + int(128 / 7)) / 256) * 7)
+
+
+def _col_width_from_px(pixels: float) -> float:
+    width = max(3.0, (pixels - 5) / 7)
+    for _ in range(6):
+        got = _px_from_col_width(width)
+        if abs(got - pixels) < 1:
+            break
+        width += (pixels - got) / 7
+    return round(width, 2)
+
+
+def _row_height_px(sheet, row: int) -> float:
+    height = sheet.row_dimensions[row].height
+    if not height:
+        height = 15
+    return float(height) * 96 / 72
+
+
+def _excel_arrow_drawing(
+    sheet,
+    layout: ToolLayout,
+    rails: _Rails,
+    *,
+    label_width: float,
+    tool_width: float,
+    gutter_width: float,
+) -> str | None:
+    """画面と同じ経路の矢印を、セル位置に結び付く線図形の XML にする。"""
+    cameras = layout.cameras
+    if not cameras or layout.max_row <= 0:
+        return None
+    label_px = _px_from_col_width(label_width)
+    tool_px = _px_from_col_width(tool_width)
+    gutter_px = _px_from_col_width(gutter_width)
+    col_widths = [label_px]
+    for _camera in cameras:
+        col_widths.extend((tool_px, gutter_px))
+    row_heights = [_row_height_px(sheet, row) for row in range(1, layout.max_row + 4)]
+    grid = _SheetGrid(col_widths, row_heights)
+    boxes: dict[tuple[int, int], _Box] = {}
+    for index, camera in enumerate(cameras):
+        left = label_px + index * (tool_px + gutter_px)
+        for row in range(1, layout.max_row + 1):
+            excel_row = row + 3
+            top = sum(row_heights[:excel_row - 1])
+            boxes[(camera.number, row)] = _Box(
+                left=left,
+                top=top,
+                height=row_heights[excel_row - 1],
+                v_gap=0,
+                width=tool_px,
+            )
+    present = {(tool.camera, tool.row) for tool in layout.tools}
+    boxes = {key: box for key, box in boxes.items() if key in present}
+    figures = _arrow_figures(layout, boxes, _LANE_OFFSET, rails)
+    anchors: list[str] = []
+    shape_id = 2
+    for kind, segments, heads in figures:
+        color = "E53935" if kind == "ref" else "1E88E5"
+        tips = {(round(head.tip[0], 1), round(head.tip[1], 1)) for head in heads}
+        for segment in segments:
+            if len(segment.points) < 2:
+                continue
+            points = _extend_arrow_shaft(segment.points, heads)
+            for start, end in zip(points, points[1:]):
+                if abs(start[0] - end[0]) < 0.5 and abs(start[1] - end[1]) < 0.5:
+                    continue
+                arrow_at_end = (round(end[0], 1), round(end[1], 1)) in tips
+                arrow_at_start = (round(start[0], 1), round(start[1], 1)) in tips
+                if arrow_at_start and not arrow_at_end:
+                    start, end = end, start
+                    arrow_at_end = True
+                anchor = _connector_anchor(
+                    grid, start, end, color, shape_id, arrow=arrow_at_end,
+                )
+                if anchor:
+                    anchors.append(anchor)
+                    shape_id += 1
+    if not anchors:
+        return None
+    body = "\n".join(anchors)
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">\n'
+        f"{body}\n"
+        "</xdr:wsDr>\n"
+    )
+
+
+def _extend_arrow_shaft(points, heads) -> list[tuple[float, float]]:
+    updated = list(points)
+    if len(updated) < 2 or abs(updated[0][1] - updated[-1][1]) > 0.5:
+        return updated
+    for head in heads:
+        shaft = (
+            head.tip[0] - head.direction[0] * _ARROW_LEN,
+            head.tip[1] - head.direction[1] * _ARROW_LEN,
+        )
+        for index, point in enumerate(updated):
+            if abs(point[0] - shaft[0]) < 1.5 and abs(point[1] - shaft[1]) < 1.5:
+                updated[index] = head.tip
+                return updated
+    return updated
+
+
+class _SheetGrid:
+    def __init__(self, col_widths: list[float], row_heights: list[float]):
+        self.col_edges = [0.0]
+        for width in col_widths:
+            self.col_edges.append(self.col_edges[-1] + width)
+        self.row_edges = [0.0]
+        for height in row_heights:
+            self.row_edges.append(self.row_edges[-1] + height)
+
+    def locate(self, x: float, y: float) -> tuple[int, int, int, int]:
+        col = _edge_index(self.col_edges, x)
+        row = _edge_index(self.row_edges, y)
+        col_span = self.col_edges[col + 1] - self.col_edges[col]
+        row_span = self.row_edges[row + 1] - self.row_edges[row]
+        col_off = int(round((x - self.col_edges[col]) * 9525))
+        row_off = int(round((y - self.row_edges[row]) * 9525))
+        col_max = max(0, int(col_span * 9525) - 1)
+        row_max = max(0, int(row_span * 9525) - 1)
+        return col, min(col_max, max(0, col_off)), row, min(row_max, max(0, row_off))
+
+
+def _edge_index(edges: list[float], value: float) -> int:
+    for index in range(len(edges) - 1):
+        if value < edges[index + 1] or index == len(edges) - 2:
+            return index
+    return len(edges) - 2
+
+
+def _connector_anchor(grid: _SheetGrid, start, end, color: str, shape_id: int, *, arrow: bool) -> str:
+    frm = grid.locate(*start)
+    to = grid.locate(*end)
+    if frm == to:
+        return ""
+    tip_at_to = arrow
+    if not _anchor_before(frm, to):
+        frm, to = to, frm
+        if arrow:
+            tip_at_to = not tip_at_to
+    if arrow and tip_at_to:
+        head = '<a:tailEnd type="triangle" w="med" len="med"/>'
+    elif arrow:
+        head = '<a:headEnd type="triangle" w="med" len="med"/>'
+    else:
+        head = ""
+    c0, co0, r0, ro0 = frm
+    c1, co1, r1, ro1 = to
+    return (
+        "<xdr:twoCellAnchor>"
+        f"<xdr:from><xdr:col>{c0}</xdr:col><xdr:colOff>{co0}</xdr:colOff>"
+        f"<xdr:row>{r0}</xdr:row><xdr:rowOff>{ro0}</xdr:rowOff></xdr:from>"
+        f"<xdr:to><xdr:col>{c1}</xdr:col><xdr:colOff>{co1}</xdr:colOff>"
+        f"<xdr:row>{r1}</xdr:row><xdr:rowOff>{ro1}</xdr:rowOff></xdr:to>"
+        "<xdr:cxnSp>"
+        "<xdr:nvCxnSpPr>"
+        f'<xdr:cNvPr id="{shape_id}" name="Arrow {shape_id}"/>'
+        "<xdr:cNvCxnSpPr/>"
+        "</xdr:nvCxnSpPr>"
+        "<xdr:spPr>"
+        '<a:xfrm><a:off x="0" y="0"/><a:ext cx="1" cy="1"/></a:xfrm>'
+        '<a:prstGeom prst="straightConnector1"><a:avLst/></a:prstGeom>'
+        f'<a:ln w="19050"><a:solidFill><a:srgbClr val="{color}"/></a:solidFill>{head}</a:ln>'
+        "</xdr:spPr>"
+        "</xdr:cxnSp>"
+        "<xdr:clientData/>"
+        "</xdr:twoCellAnchor>"
+    )
+
+
+def _anchor_before(frm: tuple[int, int, int, int], to: tuple[int, int, int, int]) -> bool:
+    if frm[2] != to[2]:
+        return frm[2] < to[2]
+    if frm[0] != to[0]:
+        return frm[0] < to[0]
+    return frm[1] <= to[1]
+
+
+def _embed_excel_drawing(path: str, drawing_xml: str) -> None:
+    import zipfile
+    from io import BytesIO
+
+    with zipfile.ZipFile(path, "r") as source:
+        names = source.namelist()
+        files = {name: source.read(name) for name in names}
+    sheet_path = _grid_sheet_target(files)
+    rels_path = sheet_path.replace("worksheets/", "worksheets/_rels/") + ".rels"
+    drawing_path = "xl/drawings/drawing1.xml"
+    rel_id = _next_rel_id(files.get(rels_path))
+    files[sheet_path] = _insert_drawing_tag(files[sheet_path], rel_id)
+    files[rels_path] = _insert_drawing_rel(files.get(rels_path), rel_id)
+    files["[Content_Types].xml"] = _insert_drawing_content_type(files["[Content_Types].xml"])
+    files[drawing_path] = drawing_xml.encode("utf-8")
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as target:
+        for name, data in files.items():
+            target.writestr(name, data)
+    with open(path, "wb") as handle:
+        handle.write(buffer.getvalue())
+
+
+def _grid_sheet_target(files: dict[str, bytes]) -> str:
+    import xml.etree.ElementTree as ET
+
+    ns = {
+        "m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+        "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+        "p": "http://schemas.openxmlformats.org/package/2006/relationships",
+    }
+    workbook = ET.fromstring(files["xl/workbook.xml"])
+    rel_id = None
+    for sheet in workbook.findall("m:sheets/m:sheet", ns):
+        if sheet.attrib.get("name") == "ツール構成":
+            rel_id = sheet.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+            break
+    rels = ET.fromstring(files["xl/_rels/workbook.xml.rels"])
+    for rel in rels:
+        if rel.attrib.get("Id") == rel_id:
+            target = rel.attrib["Target"].lstrip("/")
+            if not target.startswith("xl/"):
+                target = "xl/" + target
+            return target
+    return "xl/worksheets/sheet1.xml"
+
+
+def _next_rel_id(rels_xml: bytes | None) -> str:
+    if not rels_xml:
+        return "rId1"
+    import xml.etree.ElementTree as ET
+
+    root = ET.fromstring(rels_xml)
+    used = []
+    for rel in root:
+        rel_id = rel.attrib.get("Id", "")
+        if rel_id.startswith("rId") and rel_id[3:].isdigit():
+            used.append(int(rel_id[3:]))
+    return f"rId{max(used, default=0) + 1}"
+
+
+def _insert_drawing_tag(sheet_xml: bytes, rel_id: str) -> bytes:
+    text = sheet_xml.decode("utf-8")
+    if "<drawing " in text:
+        return sheet_xml
+    if "</worksheet>" not in text:
+        return sheet_xml
+    relation_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    if "xmlns:r=" not in text:
+        text = text.replace(
+            "<worksheet ",
+            f'<worksheet xmlns:r="{relation_ns}" ',
+            1,
+        )
+    tag = f'<drawing r:id="{rel_id}"/>'
+    return text.replace("</worksheet>", f"{tag}</worksheet>").encode("utf-8")
+
+
+def _insert_drawing_rel(rels_xml: bytes | None, rel_id: str) -> bytes:
+    rel = (
+        f'<Relationship Id="{rel_id}" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" '
+        'Target="../drawings/drawing1.xml"/>'
+    )
+    if not rels_xml:
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            f"{rel}</Relationships>"
+        )
+        return xml.encode("utf-8")
+    text = rels_xml.decode("utf-8")
+    return text.replace("</Relationships>", f"{rel}</Relationships>").encode("utf-8")
+
+
+def _insert_drawing_content_type(content_xml: bytes) -> bytes:
+    text = content_xml.decode("utf-8")
+    if "/xl/drawings/drawing1.xml" in text:
+        return content_xml
+    override = (
+        '<Override PartName="/xl/drawings/drawing1.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>'
+    )
+    return text.replace("</Types>", f"{override}</Types>").encode("utf-8")
 
 
 def _build_grid(layout: ToolLayout, metrics: _Metrics = _NORMAL) -> ft.Control:
