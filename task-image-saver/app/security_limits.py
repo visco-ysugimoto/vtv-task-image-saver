@@ -122,6 +122,19 @@ def read_zip_member(
         return read_stream_bounded(member_stream, max_bytes)
 
 
+def read_zip_member_prefix(
+    zip_ref: zipfile.ZipFile,
+    member_name: str,
+    max_bytes: int,
+) -> bytes:
+    """ZIP メンバーの先頭だけ読む。ファイル全体のサイズでは拒否しない。"""
+    if max_bytes < 0:
+        raise ValueError("max_bytes は 0 以上にしてください")
+    info = zip_ref.getinfo(member_name)
+    with zip_ref.open(info) as member_stream:
+        return member_stream.read(max_bytes)
+
+
 def _normalize_prefix_set(prefixes: list[str]) -> set[str]:
     return {
         _normalize_zip_member_path(prefix).rstrip("/")

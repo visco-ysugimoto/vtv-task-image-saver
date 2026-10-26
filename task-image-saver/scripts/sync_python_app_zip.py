@@ -21,6 +21,8 @@ APP_PY_FILES = [
     "security_limits.py",
     "task_image_saver_logic.py",
     "task_image_saver_ui.py",
+    "task_tool_layout.py",
+    "task_tool_layout_view.py",
     "utils.py",
 ]
 

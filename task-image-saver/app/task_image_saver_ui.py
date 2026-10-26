@@ -78,6 +78,11 @@ from task_image_saver_logic import (
     task_folder_task,
     task_output_folder,
 )
+from task_tool_layout import (
+    load_tool_layout_from_folder,
+    load_tool_layout_from_zip,
+)
+from task_tool_layout_view import build_tool_layout_dialog, render_tool_layout_png
 from utils import (
     TASK_FILE_EXTENSIONS_LABEL,
     TaskFolder,
@@ -164,6 +169,7 @@ class TaskImageSaverApp:
         self.dynamic_content = ft.Ref[ft.Column]()
         self.thumbnail_row = ft.Ref[ft.Row]()
         self.thumbnail_info = ft.Ref[ft.Text]()
+        self.tool_layout_btn = ft.Ref[ft.TextButton]()
         self.preview_limit_menu = ft.Ref[ft.PopupMenuButton]()
         self.preview_limit_value_text = ft.Ref[ft.Text]()
         self.preview_txt_row = ft.Ref[ft.Container]()
@@ -492,6 +498,7 @@ class TaskImageSaverApp:
         self._option2_selected_task_prefix = (
             task_folders[0].prefix if task_folders else None
         )
+        self._sync_tool_layout_button()
         self._option2_save_task_prefixes = {
             folder.prefix for folder in task_folders
         }
@@ -707,6 +714,7 @@ class TaskImageSaverApp:
         self._local_preview_generation += 1
         generation = self._local_preview_generation
         self._local_selected_task_prefix = selected.prefix
+        self._sync_tool_layout_button()
         self._sync_group_task_fields_from_folder(selected)
         self._update_local_task_list_controls()
         self._show_thumbnail_loading()
@@ -815,6 +823,127 @@ class TaskImageSaverApp:
         else:
             self._preview_zip_path = ""
             self._preview_img_folder = source_path
+        self._sync_tool_layout_button()
+
+    def _tool_layout_target(self):
+        """表示対象。(種別, パス, zip のとき task prefix)。無ければ None。"""
+        if self._current_option() == "option2":
+            zip_path = self._preview_zip_path
+            if not zip_path and self.file_path.current:
+                zip_path = (self.file_path.current.value or "").strip()
+            prefix = self._option2_selected_task_prefix
+            if zip_path and prefix and os.path.isfile(zip_path):
+                return ("zip", zip_path, prefix)
+            return None
+        task_dir = ""
+        if self._preview_source == "folder" and self._preview_img_folder:
+            task_dir = os.path.dirname(self._preview_img_folder)
+        elif self._local_selected_task_prefix:
+            task_dir = self._local_selected_task_prefix
+        if task_dir and os.path.isdir(task_dir):
+            return ("folder", task_dir, "")
+        return None
+
+    def _selected_task_label(self) -> str:
+        if self._current_option() == "option2":
+            prefix = self._option2_selected_task_prefix
+            for folder in self._option2_task_folders:
+                if folder.prefix == prefix:
+                    return folder.label
+            return prefix or ""
+        prefix = self._local_selected_task_prefix
+        for folder in self._local_task_folders:
+            if folder.prefix == prefix:
+                return folder.label
+        if prefix:
+            return os.path.basename(prefix)
+        return ""
+
+    def _sync_tool_layout_button(self) -> None:
+        btn = self.tool_layout_btn.current
+        if btn is None:
+            return
+        btn.disabled = self._tool_layout_target() is None
+        if btn.page:
+            try:
+                btn.update()
+            except Exception:
+                pass
+
+    def _on_show_tool_layout(self, e):
+        target = self._tool_layout_target()
+        if target is None:
+            return
+        kind, path, prefix = target
+        try:
+            if kind == "folder":
+                layout = load_tool_layout_from_folder(path)
+            else:
+                layout = load_tool_layout_from_zip(path, prefix)
+        except Exception as ex:
+            self._show_message_dialog(
+                "ツール構成",
+                f"読み込みに失敗しました。\n{ex}",
+            )
+            return
+        if not layout.tools:
+            self._show_message_dialog(
+                "ツール構成",
+                "ツール情報が見つかりませんでした。",
+            )
+            return
+        page_w = float(self.page.width or 1100)
+        page_h = float(self.page.height or 800)
+        label = self._selected_task_label()
+        title = f"ツール構成  {label}" if label else "ツール構成"
+        dialog = None
+
+        def close(_e):
+            self._close_dialog(dialog)
+
+        def save(compact: bool):
+            self.page.run_task(
+                self._save_tool_layout_image, layout, label, title, compact,
+            )
+
+        dialog = build_tool_layout_dialog(
+            layout,
+            page=self.page,
+            title=title,
+            on_close=close,
+            on_save=save,
+            width=max(520.0, min(1100.0, page_w - 120)),
+            height=max(360.0, min(720.0, page_h - 180)),
+        )
+        self._add_dialog(dialog)
+
+    async def _save_tool_layout_image(
+        self, layout, label: str, title: str, compact: bool = False,
+    ):
+        cleaned = re.sub(r'[\\/:*?"<>|]+', "_", (label or "").strip()) or "task"
+        default_name = f"{cleaned}_ツール構成.png"
+        try:
+            dest = await asyncio.to_thread(
+                select_save_file_dialog,
+                default_name,
+                [("PNG", "*.png")],
+                "ツール構成を保存",
+            )
+        except Exception as ex:
+            self._show_snack(f"保存ダイアログを開けませんでした: {ex}", error=True)
+            return
+        if not dest:
+            return
+        if not dest.lower().endswith(".png"):
+            dest += ".png"
+        try:
+            await asyncio.to_thread(
+                render_tool_layout_png, dest, layout, title=title, compact=compact,
+            )
+        except Exception as ex:
+            self._show_snack(f"画像の保存に失敗しました: {ex}", error=True)
+            return
+        self._show_snack(f"保存しました: {dest}")
 
     def _format_option2_meta_summary(self) -> str:
         """選択タスクのメタデータを1行にまとめる。"""
@@ -1252,6 +1381,7 @@ class TaskImageSaverApp:
         if selected.prefix != self._option2_selected_task_prefix:
             self._preview_txt_name = ""
         self._option2_selected_task_prefix = selected.prefix
+        self._sync_tool_layout_button()
         self._update_option2_save_task_controls()
         self._show_thumbnail_loading()
         row = self.thumbnail_row.current
@@ -2771,11 +2901,30 @@ class TaskImageSaverApp:
                         border_radius=panel_radius,
                         bgcolor=ft.Colors.GREY_50,
                         content=ft.Column([
-                            ft.Text(
-                                ref=self.thumbnail_info,
-                                value=info_text,
-                                size=11,
-                                color=ft.Colors.GREY_700,
+                            ft.Row(
+                                [
+                                    ft.Text(
+                                        ref=self.thumbnail_info,
+                                        value=info_text,
+                                        size=11,
+                                        color=ft.Colors.GREY_700,
+                                        expand=True,
+                                    ),
+                                    ft.TextButton(
+                                        "ツール構成",
+                                        icon=ft.Icons.ACCOUNT_TREE,
+                                        ref=self.tool_layout_btn,
+                                        disabled=True,
+                                        on_click=self._on_show_tool_layout,
+                                        style=ft.ButtonStyle(
+                                            padding=ft.Padding.symmetric(
+                                                horizontal=8, vertical=0,
+                                            ),
+                                        ),
+                                    ),
+                                ],
+                                spacing=4,
+                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
                             ),
                             self._build_preview_txt_selector_row(),
                             ft.Container(
