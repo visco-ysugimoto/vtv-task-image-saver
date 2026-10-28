@@ -86,6 +86,7 @@ from task_tool_layout_view import (
     build_tool_layout_dialog,
     render_tool_layout_png,
     render_tool_layout_xlsx,
+    use_tool_name_catalog,
 )
 from utils import (
     TASK_FILE_EXTENSIONS_LABEL,
@@ -896,6 +897,7 @@ class TaskImageSaverApp:
                 "ツール情報が見つかりませんでした。",
             )
             return
+        use_tool_name_catalog(path if kind == "folder" else None)
         page_w = float(self.page.width or 1100)
         page_h = float(self.page.height or 800)
         label = self._selected_task_label()
@@ -905,13 +907,15 @@ class TaskImageSaverApp:
         def close(_e):
             self._close_dialog(dialog)
 
-        def save(compact: bool):
+        def save(compact: bool, name_lang: str = "ja"):
             self.page.run_task(
-                self._save_tool_layout_image, layout, label, title, compact,
+                self._save_tool_layout_image, layout, label, title, compact, name_lang,
             )
 
-        def save_excel(_e):
-            self.page.run_task(self._save_tool_layout_excel, layout, label, title)
+        def save_excel(name_lang: str = "ja"):
+            self.page.run_task(
+                self._save_tool_layout_excel, layout, label, title, name_lang,
+            )
 
         dialog = build_tool_layout_dialog(
             layout,
@@ -926,7 +930,7 @@ class TaskImageSaverApp:
         self._add_dialog(dialog)
 
     async def _save_tool_layout_image(
-        self, layout, label: str, title: str, compact: bool = False,
+        self, layout, label: str, title: str, compact: bool = False, name_lang: str = "ja",
     ):
         cleaned = re.sub(r'[\\/:*?"<>|]+', "_", (label or "").strip()) or "task"
         default_name = f"{cleaned}_ツール構成.png"
@@ -946,14 +950,17 @@ class TaskImageSaverApp:
             dest += ".png"
         try:
             await asyncio.to_thread(
-                render_tool_layout_png, dest, layout, title=title, compact=compact,
+                render_tool_layout_png,
+                dest, layout, title=title, compact=compact, name_lang=name_lang,
             )
         except Exception as ex:
             self._show_snack(f"画像の保存に失敗しました: {ex}", error=True)
             return
         self._show_snack(f"保存しました: {dest}")
 
-    async def _save_tool_layout_excel(self, layout, label: str, title: str):
+    async def _save_tool_layout_excel(
+        self, layout, label: str, title: str, name_lang: str = "ja",
+    ):
         cleaned = re.sub(r'[\\/:*?"<>|]+', "_", (label or "").strip()) or "task"
         default_name = f"{cleaned}_ツール構成.xlsx"
         try:
@@ -972,7 +979,7 @@ class TaskImageSaverApp:
             dest += ".xlsx"
         try:
             await asyncio.to_thread(
-                render_tool_layout_xlsx, dest, layout, title=title,
+                render_tool_layout_xlsx, dest, layout, title=title, name_lang=name_lang,
             )
         except Exception as ex:
             self._show_snack(f"Excelの保存に失敗しました: {ex}", error=True)

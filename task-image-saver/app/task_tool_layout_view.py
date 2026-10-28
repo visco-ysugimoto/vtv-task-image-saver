@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
+import struct
 from dataclasses import dataclass
 
 import flet as ft
@@ -66,92 +68,351 @@ _DISABLED_BG = "#9E9E9E"
 _UNKNOWN_BG = "#90A4AE"
 _TOOL_FG = "#10343C"
 
+# キーは VTV 日本語のツール名。英語・韓国語・中国語は同じ文字列 ID の名前へ同じ色を付ける。
 _TOOL_COLORS = {
     "画像取込": "#1E88E5",
     "画像+図形参照表示": "#1E88E5",
     "画像・図形参照表示": "#1E88E5",
     "位置決め": "#43A047",
     "クリップ": "#FB8C00",
-"位置決め(GF)":"#43A047",
-"RobotFinder":"#43A047",
-"マルチ座標系":"#43A047",
-"動的マルチ座標系":"#43A047",
-"方向・有無検査":"#4DD0E1",
-"RotationFinder":"#4DD0E1",
-"IF分岐":"#FFFF00",
-"ELSE":"#FF80FF",
-"ENDIF":"#FF80FF",
-"タスク処理中断":"#FF80FF",
-"カウンタ更新キャンセル":"#FF80FF",
-"接点途中出力":"#FF80FF",
-"シリアル途中出力":"#FF80FF",
-"処理結果出力演算":"#FF80FF",
-"コネクタリード検査":"#4DD0E1",
-"コネクタリード分割検査":"#4DD0E1",
-"コネクタリード基準":"#4DD0E1",
-"コネクタリード検査II":"#4DD0E1",
-"3D-コネクタ検査":"#4DD0E1",
-"3D-コネクタコプラナリティ検査":"#4DD0E1",
-"ICリード検査":"#4DD0E1",
-"3D-SOPリード検査":"#4DD0E1",
-"3D-QFPリード検査":"#4DD0E1",
-"リード曲がり検査":"#4DD0E1",
-"ダムバー検査":"#4DD0E1",
-"BGA検査":"#4DD0E1",
-"3D-BGA検査":"#4DD0E1",
-"パッケージ検出・検査":"#4DD0E1",
-"パッケージ角検出":"#4DD0E1",
-"文字検査":"#C8FFC8",
-"OCV":"#C8FFC8",
-"太陽電池欠陥検査":"#4DD0E1",
-"セル検出・検査":"#4DD0E1",
-"個数検査":"#4DD0E1",
-"SealingInspect":"#4DD0E1",
-"3D-ボンディングワイヤ検査":"#4DD0E1",
-"ワイヤ検出・検査":"#4DD0E1",
-"AI-DefFinder":"#4DD0E1",
-"DefFinderブロブ検査":"#4DD0E1",
-"DefFinder":"#4DD0E1",
-"位置決め+DF+ブロブ検査":"#4DD0E1",
-"TSCDefFinderブロブ検査":"#4DD0E1",
-"パターン検査":"#4DD0E1",
-"ブロブ検査":"#4DD0E1",
-"明るさチェック":"#4DD0E1",
-"傷/異物検査":"#4DD0E1",
-"CrackFinder":"#4DD0E1",
-"マルチリニアエッジ検査":"#4DD0E1",
-"マルチ輪郭形状検査":"#4DD0E1",
-"トラッキングエッジ検査":"#4DD0E1",
-"SuperDefFinder":"#4DD0E1",
-"MatrixDefFinder":"#4DD0E1",
-"SegmentDefFinder":"#4DD0E1",
-"エッジ検出・検査":"#C8FFC8",
-"円検出・検査":"#C8FFC8",
-"直線検出":"#C8FFC8",
-"計測検出":"#C8FFC8",
-"計測編集":"#C8FFC8",
-"計測演算":"#C8FFC8",
-"3D高さ計測・検査":"#C8FFC8",
-"画像フィルタ":"#FB8C00",
-"クリップ":"#FB8C00",
-"画像間演算":"#FB8C00",
-"RGB合成":"#FB8C00",
-"PMS生成":"#FB8C00",
-"画像連結":"#FB8C00",
-"非線形画像変換":"#FB8C00",
-"3D画像生成(合焦法)":"#FB8C00",
-"2Dコード読取II":"#FF80FF",
-"2Dコード読取III":"#FF80FF",
-"カラー変換":"#4DD0E1",
-"カラー抽出":"#4DD0E1",
-"カラー位置決め":"#4DD0E1",
-"カラー識別":"#4DD0E1",
-"マスク":"#FB8C00",
-"時間待ち":"#FF80FF",
-"分配処理":"#FF80FF",
-"AI分類":"#4DD0E1",
-"AI-AnomalyFinder":"#4DD0E1",
+    "位置決め(GF)":"#43A047",
+    "RobotFinder":"#43A047",
+    "マルチ座標系":"#43A047",
+    "動的マルチ座標系":"#43A047",
+    "方向・有無検査":"#4DD0E1",
+    "RotationFinder":"#4DD0E1",
+    "IF分岐":"#FFFF00",
+    "ELSE":"#FF80FF",
+    "ENDIF":"#FF80FF",
+    "タスク処理中断":"#FF80FF",
+    "カウンタ更新キャンセル":"#FF80FF",
+    "接点途中出力":"#FF80FF",
+    "シリアル途中出力":"#FF80FF",
+    "処理結果出力演算":"#FF80FF",
+    "コネクタリード検査":"#4DD0E1",
+    "コネクタリード分割検査":"#4DD0E1",
+    "コネクタリード基準":"#4DD0E1",
+    "コネクタリード検査II":"#4DD0E1",
+    "3D-コネクタ検査":"#4DD0E1",
+    "3D-コネクタコプラナリティ検査":"#4DD0E1",
+    "ICリード検査":"#4DD0E1",
+    "3D-SOPリード検査":"#4DD0E1",
+    "3D-QFPリード検査":"#4DD0E1",
+    "リード曲がり検査":"#4DD0E1",
+    "ダムバー検査":"#4DD0E1",
+    "BGA検査":"#4DD0E1",
+    "3D-BGA検査":"#4DD0E1",
+    "パッケージ検出・検査":"#4DD0E1",
+    "パッケージ角検出":"#4DD0E1",
+    "文字検査":"#C8FFC8",
+    "OCV":"#C8FFC8",
+    "太陽電池欠陥検査":"#4DD0E1",
+    "セル検出・検査":"#4DD0E1",
+    "個数検査":"#4DD0E1",
+    "SealingInspect":"#4DD0E1",
+    "3D-ボンディングワイヤ検査":"#4DD0E1",
+    "ワイヤ検出・検査":"#4DD0E1",
+    "AI-DefFinder":"#4DD0E1",
+    "DefFinderブロブ検査":"#4DD0E1",
+    "DefFinder":"#4DD0E1",
+    "位置決め+DF+ブロブ検査":"#4DD0E1",
+    "TSCDefFinderブロブ検査":"#4DD0E1",
+    "パターン検査":"#4DD0E1",
+    "ブロブ検査":"#4DD0E1",
+    "明るさチェック":"#4DD0E1",
+    "傷/異物検査":"#4DD0E1",
+    "CrackFinder":"#4DD0E1",
+    "マルチリニアエッジ検査":"#4DD0E1",
+    "マルチ輪郭形状検査":"#4DD0E1",
+    "トラッキングエッジ検査":"#4DD0E1",
+    "SuperDefFinder":"#4DD0E1",
+    "MatrixDefFinder":"#4DD0E1",
+    "SegmentDefFinder":"#4DD0E1",
+    "エッジ検出・検査":"#C8FFC8",
+    "円検出・検査":"#C8FFC8",
+    "直線検出":"#C8FFC8",
+    "計測検出":"#C8FFC8",
+    "計測編集":"#C8FFC8",
+    "計測演算":"#C8FFC8",
+    "3D高さ計測・検査":"#C8FFC8",
+    "画像フィルタ":"#FB8C00",
+    "クリップ":"#FB8C00",
+    "画像間演算":"#FB8C00",
+    "RGB合成":"#FB8C00",
+    "PMS生成":"#FB8C00",
+    "画像連結":"#FB8C00",
+    "非線形画像変換":"#FB8C00",
+    "3D画像生成(合焦法)":"#FB8C00",
+    "2Dコード読取II":"#FF80FF",
+    "2Dコード読取III":"#FF80FF",
+    "カラー変換":"#4DD0E1",
+    "カラー抽出":"#4DD0E1",
+    "カラー位置決め":"#4DD0E1",
+    "カラー識別":"#4DD0E1",
+    "マスク":"#FB8C00",
+    "時間待ち":"#FF80FF",
+    "分配処理":"#FF80FF",
+    "AI分類":"#4DD0E1",
+    "AI-AnomalyFinder":"#4DD0E1",
 }
+
+_JP_LANG = 0x411
+_LANG_IDS = {"ja": 0x411, "en": 0x409, "ko": 0x412, "zh": 0x804}
+_LANG_LABELS = {"ja": "日本語", "en": "英語", "ko": "韓国語", "zh": "中国語"}
+_NAME_ALIASES: dict[str, str] = {}
+_NAME_FORMS: dict[str, dict[str, str]] = {}
+_ALIAS_DLL: str | None = None
+_ALIAS_READY = False
+_COMMENT_INDEX_RE = re.compile(r"\d{2}(?!\d)")
+
+
+def use_tool_name_catalog(hint_path: str | None = None) -> None:
+    """vxaCommon.dll から、色表の日本語名に対応する他言語のツール名を読む。"""
+    global _ALIAS_DLL, _ALIAS_READY, _NAME_ALIASES, _NAME_FORMS
+    dll = _find_vxa_common(hint_path)
+    if _ALIAS_READY and dll == _ALIAS_DLL:
+        return
+    _ALIAS_DLL = dll
+    _ALIAS_READY = True
+    if dll:
+        _NAME_ALIASES, _NAME_FORMS = _load_name_catalog(dll)
+    else:
+        _NAME_ALIASES = {}
+        _NAME_FORMS = {}
+
+
+def _color_key(name: str) -> str | None:
+    """色表のキーへ揃える。VTV は括弧が全角のことがある。"""
+    if name in _TOOL_COLORS:
+        return name
+    folded = name.replace("（", "(").replace("）", ")")
+    if folded in _TOOL_COLORS:
+        return folded
+    dotted = folded.replace("・", "+")
+    if dotted in _TOOL_COLORS:
+        return dotted
+    return None
+
+
+def _tool_color(name: str) -> str:
+    key = _color_key(name)
+    if key:
+        return _TOOL_COLORS[key]
+    if not _ALIAS_READY:
+        use_tool_name_catalog(None)
+    key = _NAME_ALIASES.get(name) or _NAME_ALIASES.get(
+        name.replace("（", "(").replace("）", ")")
+    )
+    if not key:
+        return _UNKNOWN_BG
+    return _TOOL_COLORS.get(key, _UNKNOWN_BG)
+
+
+def _find_vxa_common(hint_path: str | None) -> str | None:
+    roots: list[str] = []
+    if hint_path:
+        current = os.path.abspath(hint_path)
+        for _ in range(8):
+            roots.append(current)
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+    roots.append(r"C:\viscotech")
+    seen: set[str] = set()
+    for root in roots:
+        if root in seen:
+            continue
+        seen.add(root)
+        path = os.path.join(root, "bin", "vxaCommon.dll")
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _is_name_label(text: str) -> bool:
+    if not text or len(text) > 48:
+        return False
+    return not any(ch in text for ch in "\r\n%{}\\")
+
+
+def _index_keys(text: str) -> list[str]:
+    keys = [text]
+    folded = text.replace("（", "(").replace("）", ")")
+    if folded not in keys:
+        keys.append(folded)
+    dotted = folded.replace("・", "+")
+    if dotted not in keys:
+        keys.append(dotted)
+    return keys
+
+
+def _load_name_catalog(path: str) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
+    try:
+        tables = _pe_string_tables(path, tuple(_LANG_IDS.values()))
+    except OSError:
+        return {}, {}
+    candidates: list[dict[str, str]] = []
+    for sid, jp_raw in tables.get(_JP_LANG, {}).items():
+        jp_name = jp_raw.strip()
+        if not _is_name_label(jp_name):
+            continue
+        forms = {"ja": jp_name}
+        for code, lang_id in _LANG_IDS.items():
+            if code == "ja":
+                continue
+            foreign = tables.get(lang_id, {}).get(sid, "").strip()
+            if _is_name_label(foreign):
+                forms[code] = foreign
+        if len(set(forms.values())) < 2 and _color_key(jp_name) is None:
+            continue
+        candidates.append(forms)
+    candidates.sort(key=lambda forms: _color_key(forms["ja"]) is None)
+    forms_index: dict[str, dict[str, str]] = {}
+    for forms in candidates:
+        for text in forms.values():
+            for key in _index_keys(text):
+                forms_index.setdefault(key, forms)
+    grouped: dict[str, set[str]] = {}
+    for forms in candidates:
+        key = _color_key(forms["ja"])
+        if key is None:
+            continue
+        for code, text in forms.items():
+            if code == "ja" or text == key:
+                continue
+            for alias in _index_keys(text):
+                grouped.setdefault(alias, set()).add(key)
+    aliases: dict[str, str] = {}
+    for foreign, jp_names in grouped.items():
+        colors = {_TOOL_COLORS[name] for name in jp_names}
+        if len(colors) == 1:
+            aliases[foreign] = next(iter(jp_names))
+    return aliases, forms_index
+
+
+def _forms_for(name: str) -> dict[str, str] | None:
+    if not _ALIAS_READY:
+        use_tool_name_catalog(None)
+    forms = _NAME_FORMS.get(name)
+    if forms is not None:
+        return forms
+    folded = name.replace("（", "(").replace("）", ")")
+    return _NAME_FORMS.get(folded)
+
+
+def tool_name_in(name: str, lang: str) -> str:
+    """ツール種別名を指定言語の表記にする。見つからなければ元の文字列。"""
+    forms = _forms_for(name)
+    if not forms:
+        return name
+    if lang == "ja":
+        ja_name = forms.get("ja", "")
+        if name.replace("（", "(").replace("）", ")") == ja_name.replace("（", "(").replace("）", ")"):
+            return name
+    return forms.get(lang) or name
+
+
+def _comment_stem(comment: str) -> str:
+    match = _COMMENT_INDEX_RE.search(comment or "")
+    if match is None:
+        return (comment or "").strip()
+    return (comment or "")[:match.start()].rstrip(" _")
+
+
+def detect_tool_name_language(layout: ToolLayout) -> str:
+    """コメントの既定名から、タスクを作ったときのツール名の言語を推定する。"""
+    if not _ALIAS_READY:
+        use_tool_name_catalog(None)
+    scores: dict[str, int] = {}
+    for tool in layout.tools:
+        forms = _forms_for(tool.tool_name)
+        if not forms:
+            continue
+        stem = _comment_stem(tool.comment)
+        if not stem:
+            continue
+        for lang, text in forms.items():
+            if stem == text or stem.replace("（", "(").replace("）", ")") == text.replace("（", "(").replace("）", ")"):
+                scores[lang] = scores.get(lang, 0) + 1
+                break
+    if not scores:
+        return "ja"
+    best = max(scores, key=lambda lang: (scores[lang], lang != "ja"))
+    if best != "ja" and scores[best] > scores.get("ja", 0):
+        return best
+    return "ja"
+
+
+def _pe_string_tables(path: str, langs: tuple[int, ...]) -> dict[int, dict[int, str]]:
+    """PE の STRINGTABLE を言語ごとに {文字列 ID: 本文} で返す。"""
+    data = open(path, "rb").read()
+    if data[:2] != b"MZ":
+        return {}
+    pe = struct.unpack_from("<I", data, 0x3C)[0]
+    if data[pe:pe + 4] != b"PE\x00\x00":
+        return {}
+    magic = struct.unpack_from("<H", data, pe + 24)[0]
+    dd_off = pe + 24 + (112 if magic == 0x20B else 96)
+    res_rva = struct.unpack_from("<I", data, dd_off + 16)[0]
+    if not res_rva:
+        return {}
+    nsec = struct.unpack_from("<H", data, pe + 6)[0]
+    opt_size = struct.unpack_from("<H", data, pe + 20)[0]
+    sec_off = pe + 24 + opt_size
+    sections = []
+    for index in range(nsec):
+        off = sec_off + index * 40
+        va, raw_size, raw_ptr = struct.unpack_from("<III", data, off + 12)
+        sections.append((va, raw_size, raw_ptr))
+
+    def rva_to_off(rva: int) -> int | None:
+        for va, raw_size, raw_ptr in sections:
+            if va <= rva < va + max(raw_size, 1):
+                return raw_ptr + (rva - va)
+        return None
+
+    wanted = set(langs)
+    tables: dict[int, dict[int, str]] = {lang: {} for lang in wanted}
+
+    def walk(rel: int, path_ids: tuple[int, ...]):
+        off = rva_to_off(res_rva + rel)
+        if off is None:
+            return
+        named, count = struct.unpack_from("<HH", data, off + 12)
+        entry = off + 16
+        for index in range(named + count):
+            ident, child = struct.unpack_from("<II", data, entry + index * 8)
+            if ident & 0x80000000:
+                continue
+            key = path_ids + (ident,)
+            if child & 0x80000000:
+                walk(child & 0x7FFFFFFF, key)
+                continue
+            if not key or key[0] != 6 or len(key) < 3 or key[2] not in wanted:
+                continue
+            data_off = rva_to_off(res_rva + child)
+            if data_off is None:
+                continue
+            blob_rva, size = struct.unpack_from("<II", data, data_off)
+            raw = rva_to_off(blob_rva)
+            if raw is None:
+                continue
+            blob = data[raw:raw + size]
+            pos = 0
+            base = (key[1] - 1) * 16
+            for slot in range(16):
+                if pos + 2 > len(blob):
+                    break
+                length = struct.unpack_from("<H", blob, pos)[0]
+                pos += 2
+                text = blob[pos:pos + length * 2].decode("utf-16le", "replace")
+                pos += length * 2
+                if text:
+                    tables[key[2]][base + slot] = text
+
+    walk(0, ())
+    return tables
 
 
 @dataclass
@@ -204,19 +465,23 @@ def build_tool_layout_dialog(
     height: float,
 ) -> ft.AlertDialog:
     """スクロールできるツール構成ダイアログを作る。"""
+    origin = detect_tool_name_language(layout)
     state = {
         "full": False,
         "compact": False,
         "prev_full": bool(getattr(page.window, "full_screen", False)),
+        "origin": origin,
+        "lang": origin,
     }
     grid_row = ft.Row(
         scroll=ft.ScrollMode.AUTO,
         vertical_alignment=ft.CrossAxisAlignment.START,
-        controls=[_build_grid(layout, _NORMAL)],
+        controls=[_build_grid(layout, _NORMAL, state["lang"])],
     )
     content_box = ft.Container(width=width, height=height)
     compact_btn = ft.TextButton("行を圧縮", icon=ft.Icons.DENSITY_SMALL)
     full_btn = ft.TextButton("全画面", icon=ft.Icons.FULLSCREEN)
+    lang_btn = ft.TextButton("日本語で表示", icon=ft.Icons.TRANSLATE)
     dialog: ft.AlertDialog | None = None
 
     def _mode_style(active: bool) -> ft.ButtonStyle:
@@ -228,7 +493,7 @@ def build_tool_layout_dialog(
 
     def _apply_mode() -> None:
         metrics = _COMPACT if state["compact"] else _NORMAL
-        grid_row.controls = [_build_grid(layout, metrics)]
+        grid_row.controls = [_build_grid(layout, metrics, state["lang"])]
         compact_btn.text = "通常の行高" if state["compact"] else "行を圧縮"
         compact_btn.icon = (
             ft.Icons.DENSITY_MEDIUM if state["compact"] else ft.Icons.DENSITY_SMALL
@@ -239,6 +504,12 @@ def build_tool_layout_dialog(
             ft.Icons.FULLSCREEN_EXIT if state["full"] else ft.Icons.FULLSCREEN
         )
         full_btn.style = _mode_style(state["full"])
+        origin_label = _LANG_LABELS.get(state["origin"], "元の言語")
+        if state["lang"] == "ja":
+            lang_btn.text = f"{origin_label}で表示"
+        else:
+            lang_btn.text = "日本語で表示"
+        lang_btn.style = _mode_style(state["lang"] == "ja")
         if state["full"]:
             page_w = float(page.width or width + 80)
             page_h = float(page.height or height + 160)
@@ -247,6 +518,12 @@ def build_tool_layout_dialog(
         else:
             content_box.width = width
             content_box.height = height
+
+    def _toggle_lang(_e) -> None:
+        state["lang"] = state["origin"] if state["lang"] == "ja" else "ja"
+        _apply_mode()
+        grid_row.update()
+        lang_btn.update()
 
     def _toggle_compact(_e) -> None:
         state["compact"] = not state["compact"]
@@ -282,12 +559,18 @@ def build_tool_layout_dialog(
         on_close(_e)
 
     def _save(_e) -> None:
-        on_save(state["compact"])
+        on_save(state["compact"], state["lang"])
+
+    def _save_excel(_e) -> None:
+        on_save_excel(state["lang"])
 
     compact_btn.on_click = _toggle_compact
     compact_btn.style = _mode_style(False)
     full_btn.on_click = _on_full
     full_btn.style = _mode_style(False)
+    lang_btn.on_click = _toggle_lang
+    lang_btn.visible = origin != "ja"
+    _apply_mode()
     content_box.content = ft.Column(
         [
             ft.Row(
@@ -298,6 +581,7 @@ def build_tool_layout_dialog(
                         color=ft.Colors.GREY_700,
                         expand=True,
                     ),
+                    lang_btn,
                     compact_btn,
                     full_btn,
                 ],
@@ -326,7 +610,7 @@ def build_tool_layout_dialog(
             ft.TextButton(
                 "Excelとして保存",
                 icon=ft.Icons.TABLE_CHART,
-                on_click=on_save_excel,
+                on_click=_save_excel,
             ),
             ft.TextButton("閉じる", on_click=_close),
         ],
@@ -341,14 +625,23 @@ def render_tool_layout_png(
     *,
     title: str,
     compact: bool = False,
+    name_lang: str = "ja",
 ) -> None:
     """ツール構成全体を PNG に書き出す。compact のときは画面の圧縮行と同じ寸法。"""
     metrics = _COMPACT if compact else _NORMAL
-    image = _render_tool_layout_image(layout, title=title, metrics=metrics)
+    image = _render_tool_layout_image(
+        layout, title=title, metrics=metrics, name_lang=name_lang,
+    )
     image.save(path, "PNG")
 
 
-def render_tool_layout_xlsx(path: str, layout: ToolLayout, *, title: str) -> None:
+def render_tool_layout_xlsx(
+    path: str,
+    layout: ToolLayout,
+    *,
+    title: str,
+    name_lang: str = "ja",
+) -> None:
     """ツール構成を Excel ブックに書き出す。矢印はセルに追従する線図形にする。"""
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -359,9 +652,13 @@ def render_tool_layout_xlsx(path: str, layout: ToolLayout, *, title: str) -> Non
     grid.title = "ツール構成"
     drawing = _write_layout_grid(
         grid, layout, title=title, styles=(Alignment, Border, Font, PatternFill, Side),
+        name_lang=name_lang,
     )
     listing = book.create_sheet("一覧")
-    _write_layout_list(listing, layout, styles=(Alignment, Border, Font, PatternFill, Side))
+    _write_layout_list(
+        listing, layout, styles=(Alignment, Border, Font, PatternFill, Side),
+        name_lang=name_lang,
+    )
     for sheet in (grid, listing):
         sheet.page_setup.orientation = "landscape"
         sheet.page_setup.fitToWidth = 1
@@ -375,7 +672,7 @@ def render_tool_layout_xlsx(path: str, layout: ToolLayout, *, title: str) -> Non
         _embed_excel_drawing(path, drawing)
 
 
-def _write_layout_grid(sheet, layout: ToolLayout, *, title: str, styles) -> str | None:
+def _write_layout_grid(sheet, layout: ToolLayout, *, title: str, styles, name_lang: str = "ja") -> str | None:
     from openpyxl.utils import get_column_letter
 
     Alignment, Border, Font, PatternFill, Side = styles
@@ -448,7 +745,7 @@ def _write_layout_grid(sheet, layout: ToolLayout, *, title: str, styles) -> str 
             if tool is None:
                 cell.fill = PatternFill("solid", fgColor="FFFFFF")
                 continue
-            lines = _tool_lines(tool)
+            lines = _tool_lines(tool, name_lang)
             line_count = max(line_count, len(lines))
             cell.value = "\n".join(lines)
             cell.font = body_font
@@ -474,7 +771,7 @@ def _write_layout_grid(sheet, layout: ToolLayout, *, title: str, styles) -> str 
     )
 
 
-def _write_layout_list(sheet, layout: ToolLayout, *, styles) -> None:
+def _write_layout_list(sheet, layout: ToolLayout, *, styles, name_lang: str = "ja") -> None:
     from openpyxl.utils import get_column_letter
 
     Alignment, Border, Font, PatternFill, Side = styles
@@ -496,7 +793,7 @@ def _write_layout_list(sheet, layout: ToolLayout, *, styles) -> None:
         values = (
             tool.camera,
             tool.row,
-            _xlsx_text(tool.tool_name),
+            _xlsx_text(tool_name_in(tool.tool_name, name_lang)),
             _xlsx_text(tool.comment),
             "する" if tool.enabled else "しない",
             _link_text(tool.ref),
@@ -516,8 +813,8 @@ def _write_layout_list(sheet, layout: ToolLayout, *, styles) -> None:
     sheet.sheet_view.showGridLines = False
 
 
-def _tool_lines(tool: ToolCell) -> list[str]:
-    name = _xlsx_text(tool.tool_name)
+def _tool_lines(tool: ToolCell, name_lang: str = "ja") -> list[str]:
+    name = _xlsx_text(tool_name_in(tool.tool_name, name_lang))
     if not tool.enabled:
         name = f"× {name}"
     lines = [name]
@@ -534,7 +831,7 @@ def _link_text(link) -> str:
 
 
 def _tool_fill(tool: ToolCell) -> str:
-    color = _DISABLED_BG if not tool.enabled else _TOOL_COLORS.get(tool.tool_name, _UNKNOWN_BG)
+    color = _DISABLED_BG if not tool.enabled else _tool_color(tool.tool_name)
     return color.lstrip("#")
 
 
@@ -837,7 +1134,11 @@ def _insert_drawing_content_type(content_xml: bytes) -> bytes:
     return text.replace("</Types>", f"{override}</Types>").encode("utf-8")
 
 
-def _build_grid(layout: ToolLayout, metrics: _Metrics = _NORMAL) -> ft.Control:
+def _build_grid(
+    layout: ToolLayout,
+    metrics: _Metrics = _NORMAL,
+    name_lang: str = "ja",
+) -> ft.Control:
     cameras = layout.cameras
     max_row = layout.max_row
     if not cameras or max_row <= 0:
@@ -883,7 +1184,7 @@ def _build_grid(layout: ToolLayout, metrics: _Metrics = _NORMAL) -> ft.Control:
         for index, camera in enumerate(cameras):
             left = _PAD + _ROW_HEADER_W + index * slot_w
             tool = by_pos.get((camera.number, row))
-            controls.append(_tool_cell(left, top, tool, metrics))
+            controls.append(_tool_cell(left, top, tool, metrics, name_lang))
     return ft.Stack(controls=controls, width=total_w, height=total_h)
 
 
@@ -948,6 +1249,7 @@ def _tool_cell(
     top: float,
     tool: ToolCell | None,
     metrics: _Metrics = _NORMAL,
+    name_lang: str = "ja",
 ) -> ft.Container:
     if tool is None:
         return ft.Container(
@@ -958,9 +1260,9 @@ def _tool_cell(
             bgcolor=ft.Colors.WHITE,
             border=ft.Border.all(1, ft.Colors.GREY_300),
         )
-    bg = _DISABLED_BG if not tool.enabled else _TOOL_COLORS.get(tool.tool_name, _UNKNOWN_BG)
+    bg = _DISABLED_BG if not tool.enabled else _tool_color(tool.tool_name)
     name = ft.Text(
-        tool.tool_name,
+        tool_name_in(tool.tool_name, name_lang),
         size=metrics.name_size,
         weight=ft.FontWeight.W_700,
         color=_TOOL_FG,
@@ -1244,8 +1546,9 @@ def _render_tool_layout_image(
     *,
     title: str,
     metrics: _Metrics = _NORMAL,
+    name_lang: str = "ja",
 ) -> Image.Image:
-    grid = _render_grid_image(layout, metrics)
+    grid = _render_grid_image(layout, metrics, name_lang)
     scale = _EXPORT_SCALE
     header_h = 52 * scale
     image = Image.new("RGB", (grid.width, header_h + grid.height), "#FFFFFF")
@@ -1263,7 +1566,11 @@ def _render_tool_layout_image(
     return image
 
 
-def _render_grid_image(layout: ToolLayout, metrics: _Metrics = _NORMAL) -> Image.Image:
+def _render_grid_image(
+    layout: ToolLayout,
+    metrics: _Metrics = _NORMAL,
+    name_lang: str = "ja",
+) -> Image.Image:
     cameras = layout.cameras
     max_row = layout.max_row
     if not cameras or max_row <= 0:
@@ -1306,7 +1613,7 @@ def _render_grid_image(layout: ToolLayout, metrics: _Metrics = _NORMAL) -> Image
             left = _PAD + _ROW_HEADER_W + index * slot_w
             _draw_tool(
                 draw, left, top, by_pos.get((camera.number, row)),
-                tool_font, comment_font, metrics, mark_font,
+                tool_font, comment_font, metrics, mark_font, name_lang,
             )
     return image
 
@@ -1340,11 +1647,12 @@ def _draw_tool(
     comment_font,
     metrics: _Metrics = _NORMAL,
     mark_font=None,
+    name_lang: str = "ja",
 ) -> None:
     if tool is None:
         _draw_rect(draw, left, top, _CELL_W, metrics.cell_h, "#FFFFFF", "#E0E0E0")
         return
-    bg = _DISABLED_BG if not tool.enabled else _TOOL_COLORS.get(tool.tool_name, _UNKNOWN_BG)
+    bg = _DISABLED_BG if not tool.enabled else _tool_color(tool.tool_name)
     _draw_rect(draw, left, top, _CELL_W, metrics.cell_h, bg, "#9E9E9E")
     pad = 6
     text_left = left + pad
@@ -1362,7 +1670,9 @@ def _draw_tool(
         mark_w = draw.textlength(mark, font=mark_font) / _EXPORT_SCALE
         text_left += mark_w + 4
         text_width = left + _CELL_W - pad - text_left
-    name = _fit_text(draw, tool.tool_name, tool_font, _px(max(8, text_width)))
+    name = _fit_text(
+        draw, tool_name_in(tool.tool_name, name_lang), tool_font, _px(max(8, text_width)),
+    )
     comment = _fit_text(draw, tool.comment, comment_font, _px(max(8, text_width)))
     draw.text(
         (_px(text_left), _px(top + name_dy)),
