@@ -11,6 +11,7 @@ import os
 import sys
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
+from urllib.parse import unquote, urlparse
 
 import flet as ft
 
@@ -86,6 +87,33 @@ def dropzone_setup_hint() -> str:
     return ""
 
 
+def dropped_item_path(item: object) -> str:
+    """ドロップされた 1 件からローカルパスを取り出す。
+
+    flet-dropzone 0.3 はパス文字列、0.4 以降は ``name`` / ``path`` を持つ
+    オブジェクト（またはその dict）を渡す。オブジェクト全体を文字列化すると
+    末尾が拡張子にならず、対応ファイルでも拒否される。
+    """
+    if isinstance(item, str):
+        raw = item
+    elif isinstance(item, dict):
+        raw = str(item.get("path") or item.get("name") or "")
+    else:
+        raw = str(getattr(item, "path", None) or getattr(item, "name", None) or "")
+    return _normalize_dropped_path(raw)
+
+
+def _normalize_dropped_path(raw: str) -> str:
+    text = raw.replace("\x00", "").strip().strip('"').strip()
+    if not text.lower().startswith("file:"):
+        return text
+    parsed = urlparse(text)
+    text = unquote(parsed.path or "").strip()
+    if os.name == "nt" and len(text) >= 3 and text[0] == "/" and text[2] == ":":
+        text = text[1:]
+    return text
+
+
 def wrap_with_task_file_dropzone(
     content: ft.Control,
     on_task_file: Callable[[str], Awaitable[None]],
@@ -111,13 +139,15 @@ def wrap_with_task_file_dropzone(
     exts = allowed_extensions or ["ziq", "zit", "zii", "zig", "zia", "zip"]
 
     def on_dropped(e):
-        files = getattr(e, "files", None) or []
+        files = getattr(e, "files", None)
         if not files:
             return
-        path = os.path.abspath(str(files[0]).strip().strip('"'))
+        if isinstance(files, (str, dict)) or not isinstance(files, (list, tuple)):
+            files = [files]
+        path = dropped_item_path(files[0])
         if not path:
             return
-        page.run_task(on_task_file, path)
+        page.run_task(on_task_file, os.path.abspath(path))
 
     return ftd.Dropzone(
         content=content,
