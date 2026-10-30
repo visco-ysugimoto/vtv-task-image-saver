@@ -163,6 +163,12 @@ _NAME_ALIASES: dict[str, str] = {}
 _NAME_FORMS: dict[str, dict[str, str]] = {}
 _ALIAS_DLL: str | None = None
 _ALIAS_READY = False
+_TEXT_LABELS = {
+    "both": "名前とコメント",
+    "name": "ツール名のみ",
+    "comment": "コメントのみ",
+}
+_TEXT_CYCLE = ("both", "name", "comment")
 _COMMENT_INDEX_RE = re.compile(r"\d{2}(?!\d)")
 
 
@@ -472,13 +478,17 @@ def build_tool_layout_dialog(
         "prev_full": bool(getattr(page.window, "full_screen", False)),
         "origin": origin,
         "lang": origin,
+        "text": "both",
+        "arrows": True,
     }
     grid_row = ft.Row(
         scroll=ft.ScrollMode.AUTO,
         vertical_alignment=ft.CrossAxisAlignment.START,
-        controls=[_build_grid(layout, _NORMAL, state["lang"])],
+        controls=[_build_grid(layout, _NORMAL, state["lang"], state["text"], state["arrows"])],
     )
     content_box = ft.Container(width=width, height=height)
+    text_btn = ft.TextButton(_TEXT_LABELS["both"], icon=ft.Icons.SHORT_TEXT)
+    arrow_btn = ft.TextButton("矢印を隠す", icon=ft.Icons.ARROW_RIGHT_ALT)
     compact_btn = ft.TextButton("行を圧縮", icon=ft.Icons.DENSITY_SMALL)
     full_btn = ft.TextButton("全画面", icon=ft.Icons.FULLSCREEN)
     lang_btn = ft.TextButton("日本語で表示", icon=ft.Icons.TRANSLATE)
@@ -493,7 +503,13 @@ def build_tool_layout_dialog(
 
     def _apply_mode() -> None:
         metrics = _COMPACT if state["compact"] else _NORMAL
-        grid_row.controls = [_build_grid(layout, metrics, state["lang"])]
+        grid_row.controls = [
+            _build_grid(layout, metrics, state["lang"], state["text"], state["arrows"]),
+        ]
+        text_btn.text = _TEXT_LABELS[state["text"]]
+        text_btn.style = _mode_style(state["text"] != "both")
+        arrow_btn.text = "矢印を表示" if not state["arrows"] else "矢印を隠す"
+        arrow_btn.style = _mode_style(not state["arrows"])
         compact_btn.text = "通常の行高" if state["compact"] else "行を圧縮"
         compact_btn.icon = (
             ft.Icons.DENSITY_MEDIUM if state["compact"] else ft.Icons.DENSITY_SMALL
@@ -518,6 +534,19 @@ def build_tool_layout_dialog(
         else:
             content_box.width = width
             content_box.height = height
+
+    def _toggle_text(_e) -> None:
+        index = _TEXT_CYCLE.index(state["text"])
+        state["text"] = _TEXT_CYCLE[(index + 1) % len(_TEXT_CYCLE)]
+        _apply_mode()
+        grid_row.update()
+        text_btn.update()
+
+    def _toggle_arrows(_e) -> None:
+        state["arrows"] = not state["arrows"]
+        _apply_mode()
+        grid_row.update()
+        arrow_btn.update()
 
     def _toggle_lang(_e) -> None:
         state["lang"] = state["origin"] if state["lang"] == "ja" else "ja"
@@ -559,11 +588,13 @@ def build_tool_layout_dialog(
         on_close(_e)
 
     def _save(_e) -> None:
-        on_save(state["compact"], state["lang"])
+        on_save(state["compact"], state["lang"], state["text"], state["arrows"])
 
     def _save_excel(_e) -> None:
-        on_save_excel(state["lang"])
+        on_save_excel(state["lang"], state["text"], state["arrows"])
 
+    text_btn.on_click = _toggle_text
+    arrow_btn.on_click = _toggle_arrows
     compact_btn.on_click = _toggle_compact
     compact_btn.style = _mode_style(False)
     full_btn.on_click = _on_full
@@ -582,6 +613,8 @@ def build_tool_layout_dialog(
                         expand=True,
                     ),
                     lang_btn,
+                    text_btn,
+                    arrow_btn,
                     compact_btn,
                     full_btn,
                 ],
@@ -626,11 +659,18 @@ def render_tool_layout_png(
     title: str,
     compact: bool = False,
     name_lang: str = "ja",
+    text_mode: str = "both",
+    show_arrows: bool = True,
 ) -> None:
     """ツール構成全体を PNG に書き出す。compact のときは画面の圧縮行と同じ寸法。"""
     metrics = _COMPACT if compact else _NORMAL
     image = _render_tool_layout_image(
-        layout, title=title, metrics=metrics, name_lang=name_lang,
+        layout,
+        title=title,
+        metrics=metrics,
+        name_lang=name_lang,
+        text_mode=text_mode,
+        show_arrows=show_arrows,
     )
     image.save(path, "PNG")
 
@@ -641,6 +681,8 @@ def render_tool_layout_xlsx(
     *,
     title: str,
     name_lang: str = "ja",
+    text_mode: str = "both",
+    show_arrows: bool = True,
 ) -> None:
     """ツール構成を Excel ブックに書き出す。矢印はセルに追従する線図形にする。"""
     from openpyxl import Workbook
@@ -653,6 +695,8 @@ def render_tool_layout_xlsx(
     drawing = _write_layout_grid(
         grid, layout, title=title, styles=(Alignment, Border, Font, PatternFill, Side),
         name_lang=name_lang,
+        text_mode=text_mode,
+        show_arrows=show_arrows,
     )
     listing = book.create_sheet("一覧")
     _write_layout_list(
@@ -672,7 +716,16 @@ def render_tool_layout_xlsx(
         _embed_excel_drawing(path, drawing)
 
 
-def _write_layout_grid(sheet, layout: ToolLayout, *, title: str, styles, name_lang: str = "ja") -> str | None:
+def _write_layout_grid(
+    sheet,
+    layout: ToolLayout,
+    *,
+    title: str,
+    styles,
+    name_lang: str = "ja",
+    text_mode: str = "both",
+    show_arrows: bool = True,
+) -> str | None:
     from openpyxl.utils import get_column_letter
 
     Alignment, Border, Font, PatternFill, Side = styles
@@ -745,11 +798,13 @@ def _write_layout_grid(sheet, layout: ToolLayout, *, title: str, styles, name_la
             if tool is None:
                 cell.fill = PatternFill("solid", fgColor="FFFFFF")
                 continue
-            lines = _tool_lines(tool, name_lang)
+            lines = _tool_lines(tool, name_lang, text_mode)
             line_count = max(line_count, len(lines))
             cell.value = "\n".join(lines)
             cell.font = body_font
             cell.fill = PatternFill("solid", fgColor=_tool_fill(tool))
+            if len(lines) <= 1:
+                cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="left")
         sheet.row_dimensions[excel_row].height = max(36, 15 * line_count + 8)
 
     sheet.column_dimensions["A"].width = label_width
@@ -761,6 +816,8 @@ def _write_layout_grid(sheet, layout: ToolLayout, *, title: str, styles, name_la
     sheet.print_title_rows = "1:3"
     sheet.page_setup.horizontalCentered = True
     sheet.sheet_view.showGridLines = False
+    if not show_arrows:
+        return None
     return _excel_arrow_drawing(
         sheet,
         layout,
@@ -813,15 +870,19 @@ def _write_layout_list(sheet, layout: ToolLayout, *, styles, name_lang: str = "j
     sheet.sheet_view.showGridLines = False
 
 
-def _tool_lines(tool: ToolCell, name_lang: str = "ja") -> list[str]:
+def _tool_lines(tool: ToolCell, name_lang: str = "ja", text_mode: str = "both") -> list[str]:
+    show_name = text_mode != "comment"
+    show_comment = text_mode != "name"
     name = _xlsx_text(tool_name_in(tool.tool_name, name_lang))
-    if not tool.enabled:
-        name = f"× {name}"
-    lines = [name]
     comment = _xlsx_text(tool.comment)
-    if comment:
-        lines.append(comment)
-    return lines
+    mark = "× " if not tool.enabled else ""
+    lines: list[str] = []
+    if show_name:
+        lines.append(f"{mark}{name}")
+        mark = ""
+    if show_comment and comment:
+        lines.append(f"{mark}{comment}")
+    return lines or [""]
 
 
 def _link_text(link) -> str:
@@ -1138,6 +1199,8 @@ def _build_grid(
     layout: ToolLayout,
     metrics: _Metrics = _NORMAL,
     name_lang: str = "ja",
+    text_mode: str = "both",
+    show_arrows: bool = True,
 ) -> ft.Control:
     cameras = layout.cameras
     max_row = layout.max_row
@@ -1156,7 +1219,7 @@ def _build_grid(
         _build_canvas(
             total_w,
             total_h,
-            _arrow_shapes(layout, boxes, metrics.lane_offset, rails),
+            _arrow_shapes(layout, boxes, metrics.lane_offset, rails) if show_arrows else [],
         ),
         _header_cell(
             _PAD, _PAD, _ROW_HEADER_W, metrics.col_header_h, "",
@@ -1184,7 +1247,7 @@ def _build_grid(
         for index, camera in enumerate(cameras):
             left = _PAD + _ROW_HEADER_W + index * slot_w
             tool = by_pos.get((camera.number, row))
-            controls.append(_tool_cell(left, top, tool, metrics, name_lang))
+            controls.append(_tool_cell(left, top, tool, metrics, name_lang, text_mode))
     return ft.Stack(controls=controls, width=total_w, height=total_h)
 
 
@@ -1250,6 +1313,7 @@ def _tool_cell(
     tool: ToolCell | None,
     metrics: _Metrics = _NORMAL,
     name_lang: str = "ja",
+    text_mode: str = "both",
 ) -> ft.Container:
     if tool is None:
         return ft.Container(
@@ -1279,7 +1343,17 @@ def _tool_cell(
         overflow=ft.TextOverflow.ELLIPSIS,
         style=_white_edge(),
     )
-    body = ft.Column([name, comment], spacing=0, expand=True)
+    lines: list[ft.Control] = []
+    if text_mode != "comment":
+        lines.append(name)
+    if text_mode != "name" and tool.comment:
+        lines.append(comment)
+    body = ft.Column(
+        lines,
+        spacing=0,
+        expand=True,
+        alignment=ft.MainAxisAlignment.CENTER if len(lines) <= 1 else ft.MainAxisAlignment.START,
+    )
     if tool.enabled:
         content = body
     else:
@@ -1547,8 +1621,10 @@ def _render_tool_layout_image(
     title: str,
     metrics: _Metrics = _NORMAL,
     name_lang: str = "ja",
+    text_mode: str = "both",
+    show_arrows: bool = True,
 ) -> Image.Image:
-    grid = _render_grid_image(layout, metrics, name_lang)
+    grid = _render_grid_image(layout, metrics, name_lang, text_mode, show_arrows)
     scale = _EXPORT_SCALE
     header_h = 52 * scale
     image = Image.new("RGB", (grid.width, header_h + grid.height), "#FFFFFF")
@@ -1570,6 +1646,8 @@ def _render_grid_image(
     layout: ToolLayout,
     metrics: _Metrics = _NORMAL,
     name_lang: str = "ja",
+    text_mode: str = "both",
+    show_arrows: bool = True,
 ) -> Image.Image:
     cameras = layout.cameras
     max_row = layout.max_row
@@ -1588,7 +1666,8 @@ def _render_grid_image(
         (tool.camera, tool.row): _box_for(cameras, tool.camera, tool.row, metrics, slot_w)
         for tool in layout.tools
     }
-    _draw_arrows(draw, layout, boxes, metrics.lane_offset, rails)
+    if show_arrows:
+        _draw_arrows(draw, layout, boxes, metrics.lane_offset, rails)
     _draw_rect(draw, _PAD, _PAD, _ROW_HEADER_W, metrics.col_header_h, "#E8EAED", "#BDBDBD")
     name_font = _load_font(metrics.header_size * _EXPORT_SCALE)
     for index, camera in enumerate(cameras):
@@ -1613,7 +1692,7 @@ def _render_grid_image(
             left = _PAD + _ROW_HEADER_W + index * slot_w
             _draw_tool(
                 draw, left, top, by_pos.get((camera.number, row)),
-                tool_font, comment_font, metrics, mark_font, name_lang,
+                tool_font, comment_font, metrics, mark_font, name_lang, text_mode,
             )
     return image
 
@@ -1648,6 +1727,7 @@ def _draw_tool(
     metrics: _Metrics = _NORMAL,
     mark_font=None,
     name_lang: str = "ja",
+    text_mode: str = "both",
 ) -> None:
     if tool is None:
         _draw_rect(draw, left, top, _CELL_W, metrics.cell_h, "#FFFFFF", "#E0E0E0")
@@ -1670,26 +1750,34 @@ def _draw_tool(
         mark_w = draw.textlength(mark, font=mark_font) / _EXPORT_SCALE
         text_left += mark_w + 4
         text_width = left + _CELL_W - pad - text_left
-    name = _fit_text(
-        draw, tool_name_in(tool.tool_name, name_lang), tool_font, _px(max(8, text_width)),
-    )
-    comment = _fit_text(draw, tool.comment, comment_font, _px(max(8, text_width)))
-    draw.text(
-        (_px(text_left), _px(top + name_dy)),
-        name,
-        fill=_TOOL_FG,
-        font=tool_font,
-        stroke_width=2,
-        stroke_fill="#FFFFFF",
-    )
-    draw.text(
-        (_px(text_left), _px(top + comment_dy)),
-        comment,
-        fill=_TOOL_FG,
-        font=comment_font,
-        stroke_width=2,
-        stroke_fill="#FFFFFF",
-    )
+    show_name = text_mode != "comment"
+    show_comment = text_mode != "name" and bool(tool.comment)
+    if show_name and not show_comment:
+        name_dy = max(0, (metrics.cell_h - metrics.name_size) / 2)
+    elif show_comment and not show_name:
+        comment_dy = max(0, (metrics.cell_h - metrics.comment_size) / 2)
+    if show_name:
+        name = _fit_text(
+            draw, tool_name_in(tool.tool_name, name_lang), tool_font, _px(max(8, text_width)),
+        )
+        draw.text(
+            (_px(text_left), _px(top + name_dy)),
+            name,
+            fill=_TOOL_FG,
+            font=tool_font,
+            stroke_width=2,
+            stroke_fill="#FFFFFF",
+        )
+    if show_comment:
+        comment = _fit_text(draw, tool.comment, comment_font, _px(max(8, text_width)))
+        draw.text(
+            (_px(text_left), _px(top + comment_dy)),
+            comment,
+            fill=_TOOL_FG,
+            font=comment_font,
+            stroke_width=2,
+            stroke_fill="#FFFFFF",
+        )
 
 
 def _draw_rect(draw, left, top, width, height, fill: str, outline: str) -> None:
